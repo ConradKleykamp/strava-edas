@@ -1,12 +1,14 @@
 """
 Strava Heatmap Generator
-Produces three interactive HTML outputs from a Strava data export:
+Produces four interactive HTML outputs from a Strava data export:
   - strava_heatmap.html       : density heatmap of all GPS points
   - strava_pace_routes.html   : runs color-coded by pace (green=fast, red=slow)
   - strava_calendar.html      : GitHub-style calendar heatmap of daily mileage
+  - strava_animated.html      : chronological replay — runs accumulate on the map over time
 """
 
 import csv
+import json
 import math
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -343,6 +345,123 @@ class StravaHeatmapGenerator:
         fig.write_html(output, include_plotlyjs="cdn")
         print(f"Calendar heatmap saved → {output}")
 
+    def build_animated_routes(
+        self, output: str = "strava_animated.html", coord_stride: int = 3
+    ) -> None:
+        """Runs appear on the map one by one in chronological order, colored by average pace.
+
+        Includes a play/pause button, speed slider, and live date + run counter.
+        coord_stride downsamples each route to keep the HTML file size manageable.
+        """
+        if not self._routes:
+            print("No routes loaded — run .load() first")
+            return
+
+        timed_routes = [(r, r[0][2]) for r in self._routes if r[0][2] is not None]
+        timed_routes.sort(key=lambda x: x[1])
+
+        run_data = []
+        for route, start_ts in timed_routes:
+            timed = [p for p in route if p[2] is not None]
+            if len(timed) < 2:
+                continue
+            total_dist = sum(
+                _haversine(timed[i][0], timed[i][1], timed[i + 1][0], timed[i + 1][1])
+                for i in range(len(timed) - 1)
+            )
+            total_time = (timed[-1][2] - timed[0][2]).total_seconds()
+            if total_dist < 10 or total_time <= 0:
+                continue
+            avg_pace = (total_time / total_dist) * 1609.344
+            color = _pace_to_hex(avg_pace, self.fast_pace, self.slow_pace)
+            sampled = route[::coord_stride] or route
+            run_data.append({
+                "coords": [[p[0], p[1]] for p in sampled],
+                "color": color,
+                "date": start_ts.strftime("%b %d, %Y"),
+            })
+
+        if not run_data:
+            print("No routes with sufficient timestamp data")
+            return
+
+        m = self._base_map(self._center())
+        m.get_root().html.add_child(folium.Element(self._pace_legend_html()))
+
+        map_var = m.get_name()
+        total = len(run_data)
+
+        overlay = f"""
+        <div id="_ctrl" style="position:fixed;top:20px;left:50%;transform:translateX(-50%);
+            z-index:9999;background:rgba(25,25,25,0.88);color:#ddd;
+            font-family:sans-serif;font-size:13px;padding:10px 18px;
+            border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.6);
+            display:flex;align-items:center;gap:14px;user-select:none;">
+            <button id="_btn" onclick="_toggle()"
+                style="background:#fc4c02;border:none;color:#fff;padding:5px 14px;
+                       border-radius:4px;cursor:pointer;font-size:13px;">Play</button>
+            <span id="_date" style="min-width:110px;text-align:center;">—</span>
+            <span id="_count" style="color:#aaa;font-size:11px;">0 / {total}</span>
+            <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:#aaa;">
+                Speed
+                <input id="_spd" type="range" min="50" max="800" value="300" step="50"
+                    style="width:70px;cursor:pointer;" oninput="_setSpeed(this.value);">
+            </label>
+        </div>
+
+        <script>
+        const _routes = {json.dumps(run_data)};
+        let _idx = 0, _timer = null, _speed = 300, _group = null;
+
+        function _init() {{
+            _group = L.layerGroup().addTo({map_var});
+        }}
+
+        function _addRun() {{
+            if (_idx >= _routes.length) {{
+                clearInterval(_timer); _timer = null;
+                document.getElementById('_btn').textContent = 'Replay';
+                return;
+            }}
+            const r = _routes[_idx];
+            L.polyline(r.coords, {{color: r.color, weight: 2, opacity: 0.75}}).addTo(_group);
+            document.getElementById('_date').textContent = r.date;
+            document.getElementById('_count').textContent = (_idx + 1) + ' / ' + _routes.length;
+            _idx++;
+        }}
+
+        function _toggle() {{
+            const btn = document.getElementById('_btn');
+            if (btn.textContent === 'Replay') {{
+                _idx = 0;
+                _group.clearLayers();
+                document.getElementById('_date').textContent = '—';
+                document.getElementById('_count').textContent = '0 / ' + _routes.length;
+                btn.textContent = 'Play';
+                return;
+            }}
+            if (_timer) {{
+                clearInterval(_timer); _timer = null;
+                btn.textContent = 'Play';
+            }} else {{
+                btn.textContent = 'Pause';
+                _timer = setInterval(_addRun, _speed);
+            }}
+        }}
+
+        function _setSpeed(v) {{
+            _speed = 850 - parseInt(v);
+            if (_timer) {{ clearInterval(_timer); _timer = setInterval(_addRun, _speed); }}
+        }}
+
+        window.addEventListener('load', _init);
+        </script>
+        """
+
+        m.get_root().html.add_child(folium.Element(overlay))
+        m.save(output)
+        print(f"Animated routes saved → {output} ({total} runs)")
+
     def run(self) -> None:
         self.load()
         if not self._all_coords:
@@ -351,6 +470,7 @@ class StravaHeatmapGenerator:
         self.build_heatmap()
         self.build_pace_routes()
         self.build_calendar_heatmap()
+        self.build_animated_routes()
 
 
 if __name__ == "__main__":
