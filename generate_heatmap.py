@@ -271,7 +271,7 @@ class StravaHeatmapGenerator:
         df = pd.read_csv(ACTIVITIES_CSV)
         df = df[df["Activity Type"].str.lower().isin(self.activity_types)].copy()
         df["date"] = pd.to_datetime(df["Activity Date"], format="mixed")
-        df["miles"] = pd.to_numeric(df["Distance"], errors="coerce") / 1609.344
+        df["miles"] = pd.to_numeric(df["Distance"], errors="coerce") * 0.621371
         df["date_only"] = df["date"].dt.normalize()
 
         daily = df.groupby("date_only")["miles"].sum().reset_index()
