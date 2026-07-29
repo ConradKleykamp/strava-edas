@@ -1,4 +1,4 @@
-activities/
+strava/
 *.html
 venv/
 __pycache__/
