@@ -1,8 +1,7 @@
 """
 Strava Heatmap Generator
-Produces four interactive HTML outputs from a Strava data export:
+Produces three interactive HTML outputs from a Strava data export:
   - strava_heatmap.html       : density heatmap of all GPS points
-  - strava_routes.html        : individual run paths as polylines
   - strava_pace_routes.html   : runs color-coded by pace (green=fast, red=slow)
   - strava_calendar.html      : GitHub-style calendar heatmap of daily mileage
 """
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 import folium
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from folium.plugins import HeatMap
@@ -63,7 +63,7 @@ class StravaHeatmapGenerator:
         pace_stride: int = 10,
         pace_buckets: int = 10,
         fast_pace_sec_per_mile: float = 360.0,   # 6:00/mi
-        slow_pace_sec_per_mile: float = 720.0,   # 12:00/mi
+        slow_pace_sec_per_mile: float = 540.0,   # 9:00/mi
         bounds: Optional[tuple[float, float, float, float]] = MA_BOUNDS,
     ) -> None:
         self.activity_types = {t.lower() for t in activity_types}
@@ -184,29 +184,6 @@ class StravaHeatmapGenerator:
         m.save(output)
         print(f"Density heatmap saved → {output}")
 
-    def build_routes(
-        self,
-        output: str = "strava_routes.html",
-        line_color: str = "#FC4C02",
-        line_weight: float = 1.5,
-        line_opacity: float = 0.5,
-        max_routes: Optional[int] = None,
-    ) -> None:
-        if not self._routes:
-            print("No routes loaded — run .load() first")
-            return
-        m = self._base_map(self._center())
-        routes = self._routes if max_routes is None else self._routes[:max_routes]
-        for route in routes:
-            folium.PolyLine(
-                [(p[0], p[1]) for p in route],
-                color=line_color,
-                weight=line_weight,
-                opacity=line_opacity,
-            ).add_to(m)
-        m.save(output)
-        print(f"Route overlay saved → {output}")
-
     def build_pace_routes(self, output: str = "strava_pace_routes.html") -> None:
         """Draw each run as pace-colored polyline segments (green=fast, red=slow).
 
@@ -316,6 +293,12 @@ class StravaHeatmapGenerator:
         pivot_miles = daily.pivot(index="dow", columns="week_idx", values="miles").fillna(0.0)
         pivot_labels = daily.pivot(index="dow", columns="week_idx", values="label").fillna("")
 
+        # Stack label + miles into customdata so hover doesn't rely on %{z}
+        customdata = np.stack([
+            pivot_labels.values,
+            pivot_miles.round(1).astype(str).values,
+        ], axis=-1)
+
         # X-axis: show month name at first week of each month
         week_starts = daily.groupby("week_idx")["date"].min()
         x_ticks = [d.strftime("%b '%y") if d.day <= 7 else "" for d in week_starts]
@@ -334,8 +317,8 @@ class StravaHeatmapGenerator:
             zmin=0,
             showscale=True,
             colorbar=dict(title="Miles", thickness=12, len=0.6, tickfont=dict(color="#ccc")),
-            hovertemplate="<b>%{customdata}</b><br>%{z:.1f} miles<extra></extra>",
-            customdata=pivot_labels.values,
+            hovertemplate="<b>%{customdata[0]}</b><br>%{customdata[1]} miles<extra></extra>",
+            customdata=customdata,
         ))
 
         fig.update_layout(
@@ -366,7 +349,6 @@ class StravaHeatmapGenerator:
             print("No GPS data found. Check that GPX files exist in strava/activities/")
             return
         self.build_heatmap()
-        self.build_routes()
         self.build_pace_routes()
         self.build_calendar_heatmap()
 
