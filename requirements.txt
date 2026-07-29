@@ -1,2 +1,3 @@
 folium>=0.14
 pandas>=2.0
+plotly>=6.0
