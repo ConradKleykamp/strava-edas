@@ -18,6 +18,7 @@ import folium
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from folium.plugins import HeatMap
 
 GPX_NS = "http://www.topografix.com/GPX/1/1"
@@ -244,80 +245,258 @@ class StravaHeatmapGenerator:
         </div>"""
 
     def build_calendar_heatmap(self, output: str = "strava_calendar.html") -> None:
-        """GitHub-style calendar heatmap of daily mileage using Plotly."""
+        """Year-per-row calendar heatmap + monthly bar chart + weekly trend line."""
         df = pd.read_csv(ACTIVITIES_CSV)
         df = df[df["Activity Type"].str.lower().isin(self.activity_types)].copy()
         if self._included_filenames:
             df = df[df["Filename"].isin(self._included_filenames)]
+
         df["date"] = pd.to_datetime(df["Activity Date"], format="mixed")
         df["miles"] = pd.to_numeric(df["Distance"], errors="coerce") * 0.621371
         df["date_only"] = df["date"].dt.normalize()
 
-        daily = df.groupby("date_only")["miles"].sum().reset_index()
-        daily.columns = ["date", "miles"]
+        def _parse_mt(val: object) -> float:
+            if pd.isna(val):
+                return 0.0
+            parts = str(val).strip().split(":")
+            try:
+                if len(parts) == 3:
+                    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                if len(parts) == 2:
+                    return int(parts[0]) * 60 + float(parts[1])
+                return float(parts[0])
+            except (ValueError, IndexError):
+                return 0.0
+
+        df["moving_secs"] = df["Moving Time"].apply(_parse_mt)
+        if "Activity Name" in df.columns:
+            df["run_name"] = df["Activity Name"].fillna("")
+        else:
+            df["run_name"] = ""
+
+        def _fmt_pace(secs: float, mi: float) -> str:
+            if not mi or secs <= 0:
+                return "—"
+            pace = secs / mi
+            return f"{int(pace) // 60}:{int(round(pace % 60)):02d}/mi"
+
+        records = []
+        for dt, grp in df.groupby("date_only"):
+            mi = grp["miles"].sum()
+            sc = grp["moving_secs"].sum()
+            cnt = len(grp)
+            name = grp["run_name"].iloc[0] if cnt == 1 else f"{cnt} runs"
+            records.append({
+                "date": dt, "miles": mi, "secs": sc,
+                "pace": _fmt_pace(sc, mi), "name": str(name),
+            })
+
+        daily = pd.DataFrame(records)
         daily["date"] = pd.to_datetime(daily["date"])
 
         full_range = pd.date_range(daily["date"].min(), daily["date"].max(), freq="D")
         daily = (
             daily.set_index("date")
-            .reindex(full_range, fill_value=0.0)
+            .reindex(full_range)
             .reset_index()
             .rename(columns={"index": "date"})
         )
+        daily["miles"] = daily["miles"].fillna(0.0)
+        daily["pace"] = daily["pace"].fillna("—")
+        daily["name"] = daily["name"].fillna("")
 
-        daily["week_idx"] = (daily["date"] - daily["date"].min()).dt.days // 7
-        daily["dow"] = daily["date"].dt.dayofweek  # 0=Mon, 6=Sun
-        daily["label"] = daily["date"].dt.strftime("%b %d, %Y")
+        years = sorted(daily["date"].dt.year.unique())
+        n_years = len(years)
+        global_max = max(daily["miles"].max(), 0.1)
 
-        pivot_miles = daily.pivot(index="dow", columns="week_idx", values="miles").fillna(0.0)
-        pivot_labels = daily.pivot(index="dow", columns="week_idx", values="label").fillna("")
+        COLORSCALE = [
+            [0.0,  "#161b22"],
+            [0.01, "#3d1f00"],
+            [0.2,  "#8a3a00"],
+            [0.5,  "#fc4c02"],
+            [1.0,  "#ff9a5c"],
+        ]
+        DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-        # Stack label + miles into customdata so hover doesn't rely on %{z}
-        customdata = np.stack([
-            pivot_labels.values,
-            pivot_miles.round(1).astype(str).values,
-        ], axis=-1)
+        row_heights = [1.0] * n_years + [2.5, 2.5]
+        subtitles = [str(y) for y in years] + ["Monthly Mileage", "Weekly Mileage"]
 
-        # X-axis: show month name at first week of each month
-        week_starts = daily.groupby("week_idx")["date"].min()
-        x_ticks = [d.strftime("%b '%y") if d.day <= 7 else "" for d in week_starts]
+        fig = make_subplots(
+            rows=n_years + 2,
+            cols=1,
+            shared_xaxes=False,
+            row_heights=row_heights,
+            vertical_spacing=0.03,
+            subplot_titles=subtitles,
+        )
 
-        fig = go.Figure(go.Heatmap(
-            z=pivot_miles.values,
-            x=list(range(len(x_ticks))),
-            y=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-            colorscale=[
-                [0.0,  "#161b22"],
-                [0.01, "#3d1f00"],
-                [0.2,  "#8a3a00"],
-                [0.5,  "#fc4c02"],
-                [1.0,  "#ff9a5c"],
-            ],
-            zmin=0,
-            showscale=True,
-            colorbar=dict(title="Miles", thickness=12, len=0.6, tickfont=dict(color="#ccc")),
-            hovertemplate="<b>%{customdata[0]}</b><br>%{customdata[1]} miles<extra></extra>",
-            customdata=customdata,
-        ))
+        for row_idx, year in enumerate(years, start=1):
+            jan1 = pd.Timestamp(year, 1, 1)
+            dec31 = pd.Timestamp(year, 12, 31)
+            grid_start = jan1 - pd.Timedelta(days=jan1.dayofweek)
+            n_weeks = (dec31 - grid_start).days // 7 + 1
+
+            z = np.full((7, n_weeks), np.nan)
+            cd_date = np.full((7, n_weeks), "", dtype=object)
+            cd_detail = np.full((7, n_weeks), "", dtype=object)
+
+            # Seed every in-year cell as a rest day
+            for w in range(n_weeks):
+                for d in range(7):
+                    dt = grid_start + pd.Timedelta(days=w * 7 + d)
+                    if dt.year == year:
+                        z[d, w] = 0.0
+                        cd_date[d, w] = dt.strftime("%b %d, %Y")
+                        cd_detail[d, w] = "Rest"
+
+            # Overlay actual run days
+            year_data = daily[daily["date"].dt.year == year]
+            for _, row in year_data.iterrows():
+                dt = row["date"]
+                offset = (dt - grid_start).days
+                w_i, d_i = offset // 7, offset % 7
+                if 0 <= w_i < n_weeks:
+                    z[d_i, w_i] = row["miles"]
+                    cd_date[d_i, w_i] = dt.strftime("%b %d, %Y")
+                    if row["miles"] > 0:
+                        detail = f"{row['miles']:.1f} mi · {row['pace']}"
+                        if row["name"]:
+                            detail += f"<br>{row['name']}"
+                        cd_detail[d_i, w_i] = detail
+
+            customdata = np.stack([cd_date, cd_detail], axis=-1)
+
+            # Month tick positions: first week each month appears in the year
+            tick_vals: list[int] = []
+            tick_text: list[str] = []
+            seen_months: set[int] = set()
+            for w in range(n_weeks):
+                for d in range(7):
+                    dt = grid_start + pd.Timedelta(days=w * 7 + d)
+                    if dt.year == year and dt.month not in seen_months:
+                        tick_vals.append(w)
+                        tick_text.append(dt.strftime("%b"))
+                        seen_months.add(dt.month)
+                        break
+
+            fig.add_trace(
+                go.Heatmap(
+                    z=z,
+                    x=list(range(n_weeks)),
+                    y=DAY_LABELS,
+                    colorscale=COLORSCALE,
+                    zmin=0,
+                    zmax=global_max,
+                    showscale=(row_idx == 1),
+                    colorbar=dict(
+                        title="mi", thickness=10, len=0.12,
+                        tickfont=dict(color="#ccc"),
+                        title_font=dict(color="#ccc"),
+                    ),
+                    hovertemplate="<b>%{customdata[0]}</b><br>%{customdata[1]}<extra></extra>",
+                    customdata=customdata,
+                    xgap=2,
+                    ygap=2,
+                ),
+                row=row_idx, col=1,
+            )
+            fig.update_xaxes(
+                tickmode="array", tickvals=tick_vals, ticktext=tick_text,
+                showgrid=False, zeroline=False,
+                tickfont=dict(size=10, color="#aaa"),
+                row=row_idx, col=1,
+            )
+            fig.update_yaxes(
+                showgrid=False, zeroline=False, autorange="reversed",
+                tickfont=dict(size=9, color="#888"),
+                row=row_idx, col=1,
+            )
+
+        # Monthly bar chart
+        daily["ym"] = daily["date"].dt.to_period("M")
+        monthly = daily.groupby("ym")["miles"].sum().reset_index()
+        monthly["month_dt"] = monthly["ym"].dt.to_timestamp()
+
+        bar_row = n_years + 1
+        fig.add_trace(
+            go.Bar(
+                x=monthly["month_dt"],
+                y=monthly["miles"].round(1),
+                marker_color="#fc4c02",
+                marker_line_width=0,
+                opacity=0.85,
+                hovertemplate="<b>%{x|%b %Y}</b><br>%{y:.1f} mi<extra></extra>",
+                showlegend=False,
+            ),
+            row=bar_row, col=1,
+        )
+        fig.update_xaxes(
+            showgrid=False, zeroline=False,
+            tickformat="%b '%y", tickangle=-45,
+            tickfont=dict(color="#aaa", size=10),
+            row=bar_row, col=1,
+        )
+        fig.update_yaxes(
+            showgrid=True, gridcolor="#1c2330", zeroline=False,
+            tickfont=dict(color="#aaa"),
+            title_text="Miles", title_font=dict(color="#888", size=11),
+            row=bar_row, col=1,
+        )
+
+        # Weekly trend with 4-week rolling average
+        daily["week_start"] = daily["date"] - pd.to_timedelta(daily["date"].dt.dayofweek, unit="D")
+        weekly = daily.groupby("week_start")["miles"].sum().reset_index().sort_values("week_start")
+        weekly["rolling4"] = weekly["miles"].rolling(4, min_periods=1).mean()
+
+        trend_row = n_years + 2
+        fig.add_trace(
+            go.Scatter(
+                x=weekly["week_start"], y=weekly["miles"].round(1),
+                mode="lines",
+                line=dict(color="#fc4c02", width=1),
+                opacity=0.35,
+                hovertemplate="Week of %{x|%b %d, %Y}<br>%{y:.1f} mi<extra></extra>",
+                showlegend=False, name="Weekly",
+            ),
+            row=trend_row, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=weekly["week_start"], y=weekly["rolling4"].round(1),
+                mode="lines",
+                line=dict(color="#ff8c69", width=2.5),
+                hovertemplate="4-wk avg (week of %{x|%b %d, %Y})<br>%{y:.1f} mi<extra></extra>",
+                showlegend=False, name="4-wk avg",
+            ),
+            row=trend_row, col=1,
+        )
+        fig.update_xaxes(
+            showgrid=False, zeroline=False,
+            tickfont=dict(color="#aaa", size=10),
+            row=trend_row, col=1,
+        )
+        fig.update_yaxes(
+            showgrid=True, gridcolor="#1c2330", zeroline=False,
+            tickfont=dict(color="#aaa"),
+            title_text="Mi/wk", title_font=dict(color="#888", size=11),
+            row=trend_row, col=1,
+        )
+
+        height = n_years * 130 + 560 + 100
 
         fig.update_layout(
-            title=dict(text="Running Calendar", font=dict(size=22, color="#eee"), x=0.5),
+            title=dict(text="Running Dashboard", font=dict(size=22, color="#eee"), x=0.5),
             paper_bgcolor="#0d1117",
             plot_bgcolor="#0d1117",
             font=dict(color="#ccc", family="sans-serif"),
-            xaxis=dict(
-                tickmode="array",
-                tickvals=list(range(len(x_ticks))),
-                ticktext=x_ticks,
-                tickangle=-45,
-                showgrid=False,
-                zeroline=False,
-                tickfont=dict(size=10),
-            ),
-            yaxis=dict(showgrid=False, zeroline=False, autorange="reversed"),
-            height=260,
-            margin=dict(l=50, r=80, t=60, b=80),
+            height=height,
+            margin=dict(l=60, r=80, t=80, b=60),
+            bargap=0.12,
+            hoverlabel=dict(bgcolor="#1e2530", font_color="#eee", bordercolor="#333"),
         )
+
+        for ann in fig.layout.annotations:
+            ann.update(font=dict(color="#aaa", size=13))
 
         fig.write_html(output, include_plotlyjs="cdn")
         print(f"Calendar heatmap saved → {output}")
