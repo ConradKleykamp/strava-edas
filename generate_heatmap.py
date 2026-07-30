@@ -1,10 +1,9 @@
 """
 Strava Heatmap Generator
-Produces four interactive HTML outputs from a Strava data export:
-  - strava_heatmap.html       : density heatmap of all GPS points
-  - strava_pace_routes.html   : runs color-coded by pace (green=fast, red=slow)
-  - strava_calendar.html      : GitHub-style calendar heatmap of daily mileage
-  - strava_animated.html      : chronological replay — runs accumulate on the map over time
+Produces three interactive HTML outputs from a Strava data export:
+  - strava_heatmap.html   : density heatmap of all GPS points
+  - strava_calendar.html  : GitHub-style calendar heatmap of daily mileage
+  - strava_animated.html  : chronological replay — runs accumulate on the map over time
 """
 
 import csv
@@ -102,8 +101,6 @@ class StravaHeatmapGenerator:
         heatmap_blur: int = 10,
         heatmap_min_opacity: float = 0.3,
         default_zoom: int = 12,
-        pace_stride: int = 10,
-        pace_buckets: int = 10,
         fast_pace_sec_per_mile: float = 360.0,   # 6:00/mi
         slow_pace_sec_per_mile: float = 540.0,   # 9:00/mi
         bounds: Optional[tuple[float, float, float, float]] = MA_BOUNDS,
@@ -113,11 +110,10 @@ class StravaHeatmapGenerator:
         self.heatmap_blur = heatmap_blur
         self.heatmap_min_opacity = heatmap_min_opacity
         self.default_zoom = default_zoom
-        self.pace_stride = pace_stride
-        self.pace_buckets = pace_buckets
         self.fast_pace = fast_pace_sec_per_mile
         self.slow_pace = slow_pace_sec_per_mile
         self.bounds = bounds
+
         self._activities: list[dict] = []
         self._all_coords: list[tuple[float, float]] = []
         self._routes: list[list[Point]] = []
@@ -206,11 +202,6 @@ class StravaHeatmapGenerator:
     def _base_map(self, center: tuple[float, float]) -> folium.Map:
         return folium.Map(location=center, zoom_start=self.default_zoom, tiles="CartoDB dark_matter")
 
-    def _bucket_color(self, bucket: int) -> str:
-        t = bucket / max(self.pace_buckets - 1, 1)
-        pace = self.fast_pace + t * (self.slow_pace - self.fast_pace)
-        return _pace_to_hex(pace, self.fast_pace, self.slow_pace)
-
     # ------------------------------------------------------------------
     # Outputs
     # ------------------------------------------------------------------
@@ -228,64 +219,6 @@ class StravaHeatmapGenerator:
         ).add_to(m)
         m.save(output)
         print(f"Density heatmap saved → {output}")
-
-    def build_pace_routes(self, output: str = "strava_pace_routes.html") -> None:
-        """Draw each run as pace-colored polyline segments (green=fast, red=slow).
-
-        Consecutive segments that fall in the same pace bucket are merged into a
-        single PolyLine to keep the map performant (~10 buckets vs thousands of
-        individual 2-point lines).
-        """
-        if not self._routes:
-            print("No routes loaded — run .load() first")
-            return
-
-        m = self._base_map(self._center())
-        m.get_root().html.add_child(folium.Element(self._pace_legend_html()))
-
-        routes_drawn = 0
-        for route in self._routes:
-            timed = [p for p in route if p[2] is not None]
-            if len(timed) < 2:
-                folium.PolyLine(
-                    [(p[0], p[1]) for p in route],
-                    color="#888888", weight=1.5, opacity=0.35,
-                ).add_to(m)
-                continue
-
-            strided = timed[:: self.pace_stride] or timed
-
-            run_segments: list[tuple[int, list[tuple[float, float]]]] = []
-            for i in range(len(strided) - 1):
-                a, b = strided[i], strided[i + 1]
-                dist = _haversine(a[0], a[1], b[0], b[1])
-                dt = (b[2] - a[2]).total_seconds()  # type: ignore[operator]
-                if dist < 1 or dt <= 0:
-                    continue
-                pace = (dt / dist) * 1609.344
-                bucket = min(
-                    self.pace_buckets - 1,
-                    int(max(0.0, min(1.0, (pace - self.fast_pace) / (self.slow_pace - self.fast_pace))) * self.pace_buckets),
-                )
-                coord = (a[0], a[1])
-                next_coord = (b[0], b[1])
-                if run_segments and run_segments[-1][0] == bucket:
-                    run_segments[-1][1].append(next_coord)
-                else:
-                    run_segments.append((bucket, [coord, next_coord]))
-
-            for bucket, coords in run_segments:
-                folium.PolyLine(
-                    coords,
-                    color=self._bucket_color(bucket),
-                    weight=2,
-                    opacity=0.75,
-                ).add_to(m)
-
-            routes_drawn += 1
-
-        m.save(output)
-        print(f"Pace-colored routes saved → {output} ({routes_drawn} routes with timestamps)")
 
     def _pace_legend_html(self) -> str:
         def fmt(sec: float) -> str:
@@ -641,7 +574,6 @@ class StravaHeatmapGenerator:
             print("No GPS data found. Check that GPX files exist in strava/activities/")
             return
         self.build_heatmap()
-        self.build_pace_routes()
         self.build_calendar_heatmap()
         self.build_animated_routes()
 
