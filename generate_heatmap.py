@@ -348,10 +348,11 @@ class StravaHeatmapGenerator:
     def build_animated_routes(
         self, output: str = "strava_animated.html", coord_stride: int = 3
     ) -> None:
-        """Runs appear on the map one by one in chronological order, colored by average pace.
+        """Chronological replay with three enhancements over a simple pop-in:
 
-        Includes a play/pause button, speed slider, and live date + run counter.
-        coord_stride downsamples each route to keep the HTML file size manageable.
+        - Route trace: each run draws itself via requestAnimationFrame (~15 frames)
+        - Recency fading: newest run is brightest; older runs dim toward a floor opacity
+        - Stats ticker: cumulative miles, run count, and rolling avg pace update live
         """
         if not self._routes:
             print("No routes loaded — run .load() first")
@@ -379,6 +380,8 @@ class StravaHeatmapGenerator:
                 "coords": [[p[0], p[1]] for p in sampled],
                 "color": color,
                 "date": start_ts.strftime("%b %d, %Y"),
+                "miles": round(total_dist / 1609.344, 2),
+                "pace_sec": round(avg_pace),
             })
 
         if not run_data:
@@ -394,64 +397,133 @@ class StravaHeatmapGenerator:
         overlay = f"""
         <div id="_ctrl" style="position:fixed;top:20px;left:50%;transform:translateX(-50%);
             z-index:9999;background:rgba(25,25,25,0.88);color:#ddd;
-            font-family:sans-serif;font-size:13px;padding:10px 18px;
-            border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.6);
-            display:flex;align-items:center;gap:14px;user-select:none;">
+            font-family:sans-serif;font-size:13px;padding:10px 18px;border-radius:8px;
+            box-shadow:0 2px 10px rgba(0,0,0,0.6);display:flex;align-items:center;
+            gap:14px;user-select:none;">
             <button id="_btn" onclick="_toggle()"
                 style="background:#fc4c02;border:none;color:#fff;padding:5px 14px;
-                       border-radius:4px;cursor:pointer;font-size:13px;">Play</button>
+                       border-radius:4px;cursor:pointer;font-size:13px;min-width:60px;">Play</button>
             <span id="_date" style="min-width:110px;text-align:center;">—</span>
-            <span id="_count" style="color:#aaa;font-size:11px;">0 / {total}</span>
+            <span id="_count" style="color:#aaa;font-size:11px;min-width:72px;">0 / {total}</span>
             <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:#aaa;">
                 Speed
-                <input id="_spd" type="range" min="50" max="800" value="300" step="50"
+                <input id="_spd" type="range" min="0" max="700" value="500" step="50"
                     style="width:70px;cursor:pointer;" oninput="_setSpeed(this.value);">
             </label>
         </div>
 
+        <div id="_stats" style="position:fixed;bottom:30px;left:10px;z-index:9999;
+            background:rgba(25,25,25,0.88);color:#ddd;font-family:sans-serif;
+            padding:12px 20px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.6);">
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;text-align:center;">
+                <div>
+                    <div style="font-size:10px;color:#888;letter-spacing:.6px;margin-bottom:3px;">TOTAL MILES</div>
+                    <div id="_smiles" style="font-size:20px;font-weight:600;">0.0</div>
+                </div>
+                <div>
+                    <div style="font-size:10px;color:#888;letter-spacing:.6px;margin-bottom:3px;">RUNS</div>
+                    <div id="_sruns" style="font-size:20px;font-weight:600;">0</div>
+                </div>
+                <div>
+                    <div style="font-size:10px;color:#888;letter-spacing:.6px;margin-bottom:3px;">AVG PACE</div>
+                    <div id="_space" style="font-size:20px;font-weight:600;">—</div>
+                </div>
+            </div>
+        </div>
+
         <script>
         const _routes = {json.dumps(run_data)};
-        let _idx = 0, _timer = null, _speed = 300, _group = null;
+        let _idx = 0, _playing = false, _speed = 200;
+        let _group = null, _layers = [], _totalMiles = 0, _paceSum = 0;
+
+        // Opacity schedule: index 0 = newest run, floor applied to all older ones.
+        // Only the last OP.length+1 polylines are ever updated per run — O(1).
+        const _OP = [0.85, 0.65, 0.45, 0.30];
+        const _OP_FLOOR = 0.18;
 
         function _init() {{
             _group = L.layerGroup().addTo({map_var});
         }}
 
-        function _addRun() {{
-            if (_idx >= _routes.length) {{
-                clearInterval(_timer); _timer = null;
-                document.getElementById('_btn').textContent = 'Replay';
+        function _fmtPace(sec) {{
+            const m = Math.floor(sec / 60);
+            const s = Math.round(sec % 60);
+            return m + ':' + String(s).padStart(2, '0') + '/mi';
+        }}
+
+        function _updateOpacities() {{
+            const n = _layers.length;
+            const upd = Math.min(n, _OP.length + 1);
+            for (let i = 0; i < upd; i++) {{
+                _layers[n - 1 - i].setStyle({{opacity: i < _OP.length ? _OP[i] : _OP_FLOOR}});
+            }}
+        }}
+
+        function _updateStats() {{
+            document.getElementById('_smiles').textContent = _totalMiles.toFixed(1);
+            document.getElementById('_sruns').textContent = _idx;
+            if (_idx > 0)
+                document.getElementById('_space').textContent = _fmtPace(_paceSum / _idx);
+        }}
+
+        function _traceRun(r, onDone) {{
+            const poly = L.polyline([], {{color: r.color, weight: 2, opacity: _OP[0]}}).addTo(_group);
+            _layers.push(poly);
+            _updateOpacities();
+            const pts = r.coords;
+            const ppf = Math.max(1, Math.ceil(pts.length / 15));
+            let i = 0;
+            (function frame() {{
+                for (let k = 0; k < ppf && i < pts.length; k++, i++) poly.addLatLng(pts[i]);
+                i < pts.length ? requestAnimationFrame(frame) : onDone();
+            }})();
+        }}
+
+        function _nextRun() {{
+            if (!_playing || _idx >= _routes.length) {{
+                if (_idx >= _routes.length) {{
+                    _playing = false;
+                    document.getElementById('_btn').textContent = 'Replay';
+                }}
                 return;
             }}
             const r = _routes[_idx];
-            L.polyline(r.coords, {{color: r.color, weight: 2, opacity: 0.75}}).addTo(_group);
-            document.getElementById('_date').textContent = r.date;
-            document.getElementById('_count').textContent = (_idx + 1) + ' / ' + _routes.length;
+            _totalMiles += r.miles;
+            _paceSum += r.pace_sec;
             _idx++;
+            document.getElementById('_date').textContent = r.date;
+            document.getElementById('_count').textContent = _idx + ' / ' + _routes.length;
+            _updateStats();
+            _traceRun(r, function() {{
+                if (_playing) setTimeout(_nextRun, _speed);
+            }});
         }}
 
         function _toggle() {{
             const btn = document.getElementById('_btn');
             if (btn.textContent === 'Replay') {{
-                _idx = 0;
+                _idx = 0; _totalMiles = 0; _paceSum = 0; _layers = [];
                 _group.clearLayers();
                 document.getElementById('_date').textContent = '—';
                 document.getElementById('_count').textContent = '0 / ' + _routes.length;
+                document.getElementById('_smiles').textContent = '0.0';
+                document.getElementById('_sruns').textContent = '0';
+                document.getElementById('_space').textContent = '—';
                 btn.textContent = 'Play';
                 return;
             }}
-            if (_timer) {{
-                clearInterval(_timer); _timer = null;
+            if (_playing) {{
+                _playing = false;
                 btn.textContent = 'Play';
             }} else {{
+                _playing = true;
                 btn.textContent = 'Pause';
-                _timer = setInterval(_addRun, _speed);
+                _nextRun();
             }}
         }}
 
         function _setSpeed(v) {{
-            _speed = 850 - parseInt(v);
-            if (_timer) {{ clearInterval(_timer); _timer = setInterval(_addRun, _speed); }}
+            _speed = 700 - parseInt(v);
         }}
 
         window.addEventListener('load', _init);
