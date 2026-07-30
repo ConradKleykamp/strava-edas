@@ -71,7 +71,7 @@ def _best_segment_time(
 
     Accepts a precomputed cumulative-distance array so the caller can reuse it
     across multiple target distances without redundant haversine calls.
-    Segments implying a pace faster than 3:00/mile are rejected as GPS noise.
+    Segments implying a pace faster than 5:00/mile are rejected as GPS noise.
     """
     if not cum or cum[-1] < target_m * 0.9:
         return None
@@ -121,6 +121,7 @@ class StravaHeatmapGenerator:
         self._activities: list[dict] = []
         self._all_coords: list[tuple[float, float]] = []
         self._routes: list[list[Point]] = []
+        self._included_filenames: set[str] = set()
 
     # ------------------------------------------------------------------
     # Loading
@@ -151,6 +152,7 @@ class StravaHeatmapGenerator:
     def _parse_gpx_files(self) -> tuple[list[list[Point]], list[tuple[float, float]]]:
         routes: list[list[Point]] = []
         all_coords: list[tuple[float, float]] = []
+        self._included_filenames = set()
         skipped = 0
         for activity in self._activities:
             filename = activity.get("Filename", "").strip()
@@ -164,6 +166,7 @@ class StravaHeatmapGenerator:
                 continue
             routes.append(points)
             all_coords.extend((p[0], p[1]) for p in points)
+            self._included_filenames.add(filename)
         if skipped:
             print(f"  Excluded {skipped} routes outside bounds")
         return routes, all_coords
@@ -252,7 +255,6 @@ class StravaHeatmapGenerator:
 
             strided = timed[:: self.pace_stride] or timed
 
-            # Calculate pace bucket per segment, then merge consecutive same-bucket segments
             run_segments: list[tuple[int, list[tuple[float, float]]]] = []
             for i in range(len(strided) - 1):
                 a, b = strided[i], strided[i + 1]
@@ -312,6 +314,8 @@ class StravaHeatmapGenerator:
         """GitHub-style calendar heatmap of daily mileage using Plotly."""
         df = pd.read_csv(ACTIVITIES_CSV)
         df = df[df["Activity Type"].str.lower().isin(self.activity_types)].copy()
+        if self._included_filenames:
+            df = df[df["Filename"].isin(self._included_filenames)]
         df["date"] = pd.to_datetime(df["Activity Date"], format="mixed")
         df["miles"] = pd.to_numeric(df["Distance"], errors="coerce") * 0.621371
         df["date_only"] = df["date"].dt.normalize()
@@ -556,7 +560,11 @@ class StravaHeatmapGenerator:
 
         function _resetPRs() {{
             _prs = {{}};
-            {"; ".join(f'document.getElementById("_pr_{key}").textContent = "—"; document.getElementById("_pr_{key}").style.color = "#ddd"' for _, key, _ in PR_DISTANCES)};
+            {json.dumps([key for _, key, _ in PR_DISTANCES])}.forEach(k => {{
+                const el = document.getElementById('_pr_' + k);
+                el.textContent = '—';
+                el.style.color = '#ddd';
+            }});
         }}
 
         function _traceRun(r, onDone) {{
