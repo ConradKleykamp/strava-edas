@@ -29,6 +29,16 @@ DEFAULT_TYPES = {"run"}
 # Massachusetts bounding box (min_lat, max_lat, min_lon, max_lon)
 MA_BOUNDS = (41.239, 42.886, -73.508, -69.928)
 
+# PR distances: (display label, element id suffix, meters)
+PR_DISTANCES = [
+    ("400M",   "400m",  400.0),
+    ("1 MILE", "1mi",   1609.344),
+    ("2 MILE", "2mi",   3218.688),
+    ("5K",     "5k",    5000.0),
+    ("10K",    "10k",   10000.0),
+    ("HALF",   "half",  21097.5),
+]
+
 # (lat, lon, timestamp)
 Point = tuple[float, float, Optional[datetime]]
 
@@ -52,6 +62,36 @@ def _pace_to_hex(pace_sec_per_mile: float, fast: float, slow: float) -> str:
         s = (t - 0.5) * 2
         r, g, b = int(255 - s * 63), int(215 - s * 158), int(s * 43)
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _best_segment_time(
+    cum: list[float], timed: list[Point], target_m: float
+) -> Optional[float]:
+    """Minimum elapsed seconds to cover target_m using a two-pointer sliding window.
+
+    Accepts a precomputed cumulative-distance array so the caller can reuse it
+    across multiple target distances without redundant haversine calls.
+    Segments implying a pace faster than 3:00/mile are rejected as GPS noise.
+    """
+    if not cum or cum[-1] < target_m * 0.9:
+        return None
+    best: Optional[float] = None
+    j = 0
+    for i in range(len(timed)):
+        if cum[-1] - cum[i] < target_m:
+            break
+        if j <= i:
+            j = i + 1
+        while j < len(timed) and cum[j] - cum[i] < target_m:
+            j += 1
+        if j >= len(timed):
+            break
+        elapsed = (timed[j][2] - timed[i][2]).total_seconds()  # type: ignore[operator]
+        dist = cum[j] - cum[i]
+        if elapsed > 0 and (elapsed / dist * 1609.344) >= 300:  # >= 5:00/mile
+            if best is None or elapsed < best:
+                best = elapsed
+    return best
 
 
 class StravaHeatmapGenerator:
@@ -348,11 +388,11 @@ class StravaHeatmapGenerator:
     def build_animated_routes(
         self, output: str = "strava_animated.html", coord_stride: int = 3
     ) -> None:
-        """Chronological replay with three enhancements over a simple pop-in:
+        """Chronological replay with route tracing, recency fading, stats ticker, and PR panel.
 
-        - Route trace: each run draws itself via requestAnimationFrame (~15 frames)
-        - Recency fading: newest run is brightest; older runs dim toward a floor opacity
-        - Stats ticker: cumulative miles, run count, and rolling avg pace update live
+        For each run the best segment time is pre-computed in Python (two-pointer sliding
+        window over cumulative GPS distances) and shipped in the JSON payload so the
+        JavaScript only needs to compare values — no heavy computation in the browser.
         """
         if not self._routes:
             print("No routes loaded — run .load() first")
@@ -366,22 +406,34 @@ class StravaHeatmapGenerator:
             timed = [p for p in route if p[2] is not None]
             if len(timed) < 2:
                 continue
-            total_dist = sum(
-                _haversine(timed[i][0], timed[i][1], timed[i + 1][0], timed[i + 1][1])
-                for i in range(len(timed) - 1)
-            )
-            total_time = (timed[-1][2] - timed[0][2]).total_seconds()
+
+            # Build cumulative distance array once; reuse for total_dist and all PRs.
+            cum = [0.0]
+            for i in range(1, len(timed)):
+                cum.append(cum[-1] + _haversine(
+                    timed[i - 1][0], timed[i - 1][1], timed[i][0], timed[i][1]
+                ))
+            total_dist = cum[-1]
+            total_time = (timed[-1][2] - timed[0][2]).total_seconds()  # type: ignore[operator]
             if total_dist < 10 or total_time <= 0:
                 continue
+
             avg_pace = (total_time / total_dist) * 1609.344
             color = _pace_to_hex(avg_pace, self.fast_pace, self.slow_pace)
             sampled = route[::coord_stride] or route
+
+            prs = {
+                key: (round(t, 1) if (t := _best_segment_time(cum, timed, dist_m)) else None)
+                for _, key, dist_m in PR_DISTANCES
+            }
+
             run_data.append({
                 "coords": [[p[0], p[1]] for p in sampled],
                 "color": color,
                 "date": start_ts.strftime("%b %d, %Y"),
                 "miles": round(total_dist / 1609.344, 2),
                 "pace_sec": round(avg_pace),
+                "prs": prs,
             })
 
         if not run_data:
@@ -393,6 +445,14 @@ class StravaHeatmapGenerator:
 
         map_var = m.get_name()
         total = len(run_data)
+
+        pr_cells = "".join(
+            f"""<div>
+                    <div style="font-size:10px;color:#888;letter-spacing:.5px;margin-bottom:2px;">{label}</div>
+                    <div id="_pr_{key}" style="font-size:15px;font-weight:600;transition:color .4s;">—</div>
+                </div>"""
+            for label, key, _ in PR_DISTANCES
+        )
 
         overlay = f"""
         <div id="_ctrl" style="position:fixed;top:20px;left:50%;transform:translateX(-50%);
@@ -414,7 +474,8 @@ class StravaHeatmapGenerator:
 
         <div id="_stats" style="position:fixed;bottom:30px;left:10px;z-index:9999;
             background:rgba(25,25,25,0.88);color:#ddd;font-family:sans-serif;
-            padding:12px 20px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.6);">
+            padding:12px 20px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.6);
+            min-width:260px;">
             <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;text-align:center;">
                 <div>
                     <div style="font-size:10px;color:#888;letter-spacing:.6px;margin-bottom:3px;">TOTAL MILES</div>
@@ -429,15 +490,20 @@ class StravaHeatmapGenerator:
                     <div id="_space" style="font-size:20px;font-weight:600;">—</div>
                 </div>
             </div>
+            <div style="border-top:1px solid #333;margin-top:10px;padding-top:8px;">
+                <div style="font-size:10px;color:#888;letter-spacing:.6px;margin-bottom:6px;">SEGMENT PRs</div>
+                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px 16px;text-align:center;">
+                    {pr_cells}
+                </div>
+            </div>
         </div>
 
         <script>
         const _routes = {json.dumps(run_data)};
         let _idx = 0, _playing = false, _speed = 200;
         let _group = null, _layers = [], _totalMiles = 0, _paceSum = 0;
+        let _prs = {{}};
 
-        // Opacity schedule: index 0 = newest run, floor applied to all older ones.
-        // Only the last OP.length+1 polylines are ever updated per run — O(1).
         const _OP = [0.85, 0.65, 0.45, 0.30];
         const _OP_FLOOR = 0.18;
 
@@ -445,10 +511,19 @@ class StravaHeatmapGenerator:
             _group = L.layerGroup().addTo({map_var});
         }}
 
+        function _fmt(sec) {{
+            sec = Math.round(sec);
+            const h = Math.floor(sec / 3600);
+            const m = Math.floor((sec % 3600) / 60);
+            const s = sec % 60;
+            if (h > 0) return h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+            return m + ':' + String(s).padStart(2,'0');
+        }}
+
         function _fmtPace(sec) {{
             const m = Math.floor(sec / 60);
             const s = Math.round(sec % 60);
-            return m + ':' + String(s).padStart(2, '0') + '/mi';
+            return m + ':' + String(s).padStart(2,'0') + '/mi';
         }}
 
         function _updateOpacities() {{
@@ -464,6 +539,24 @@ class StravaHeatmapGenerator:
             document.getElementById('_sruns').textContent = _idx;
             if (_idx > 0)
                 document.getElementById('_space').textContent = _fmtPace(_paceSum / _idx);
+        }}
+
+        function _updatePRs(runPRs) {{
+            for (const [key, t] of Object.entries(runPRs)) {{
+                if (t === null) continue;
+                if (_prs[key] === undefined || t < _prs[key]) {{
+                    _prs[key] = t;
+                    const el = document.getElementById('_pr_' + key);
+                    el.textContent = _fmt(t);
+                    el.style.color = '#4ade80';
+                    setTimeout(() => {{ el.style.color = '#ddd'; }}, 1200);
+                }}
+            }}
+        }}
+
+        function _resetPRs() {{
+            _prs = {{}};
+            {"; ".join(f'document.getElementById("_pr_{key}").textContent = "—"; document.getElementById("_pr_{key}").style.color = "#ddd"' for _, key, _ in PR_DISTANCES)};
         }}
 
         function _traceRun(r, onDone) {{
@@ -494,6 +587,7 @@ class StravaHeatmapGenerator:
             document.getElementById('_date').textContent = r.date;
             document.getElementById('_count').textContent = _idx + ' / ' + _routes.length;
             _updateStats();
+            _updatePRs(r.prs);
             _traceRun(r, function() {{
                 if (_playing) setTimeout(_nextRun, _speed);
             }});
@@ -504,6 +598,7 @@ class StravaHeatmapGenerator:
             if (btn.textContent === 'Replay') {{
                 _idx = 0; _totalMiles = 0; _paceSum = 0; _layers = [];
                 _group.clearLayers();
+                _resetPRs();
                 document.getElementById('_date').textContent = '—';
                 document.getElementById('_count').textContent = '0 / ' + _routes.length;
                 document.getElementById('_smiles').textContent = '0.0';
@@ -522,9 +617,7 @@ class StravaHeatmapGenerator:
             }}
         }}
 
-        function _setSpeed(v) {{
-            _speed = 700 - parseInt(v);
-        }}
+        function _setSpeed(v) {{ _speed = 700 - parseInt(v); }}
 
         window.addEventListener('load', _init);
         </script>
