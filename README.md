@@ -12,6 +12,24 @@ locally against the export you already have.
 
 This works with anyone's Strava data — just drop in your own export.
 
+## Scope
+
+Built for **running** data, and defaults to only including `Run` activities
+(`DEFAULT_TYPES = {"run"}`). The pace coloring, GPS-noise filtering, and PR
+distances throughout `generate_heatmap.py` are all tuned around running paces.
+
+The density heatmap and calendar heatmap are activity-agnostic — pointing
+`activity_types` at `{"ride"}`, `{"walk"}`, `{"hike"}`, etc. (see
+[Configuration](#configuration)) works fine for those two outputs, since they
+just aggregate GPS points and distance/time. The animated replay
+(`strava_animated.html`) will not: it discards any segment faster than
+5:00/mile as GPS noise, which throws out real cycling (or any faster) data,
+and its pace-based color scale and PR distances (400m through half marathon)
+are calibrated for running paces and race distances. Using it for a faster
+activity type requires overriding `fast_pace_sec_per_mile` /
+`slow_pace_sec_per_mile` at minimum, and the PR panel will still be
+meaningless for anything other than running.
+
 ## Setup
 
 ```bash
