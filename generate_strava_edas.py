@@ -178,10 +178,10 @@ class StravaHeatmapGenerator:
         heatmap_blur: int = 10,
         heatmap_min_opacity: float = 0.3,
         default_zoom: int = 12,
-        fast_pace_sec_per_mile: float = 360.0,   # 6:00/mi
-        slow_pace_sec_per_mile: float = 540.0,   # 9:00/mi
-        hr_low_bpm: float = 130.0,               # heart rate treated as "easy" for color scaling
-        hr_high_bpm: float = 175.0,              # heart rate treated as "hard" for color scaling
+        fast_pace_sec_per_mile: Optional[float] = None,  # None = auto (5th percentile of your paces)
+        slow_pace_sec_per_mile: Optional[float] = None,  # None = auto (95th percentile of your paces)
+        hr_low_bpm: Optional[float] = None,   # None = auto (5th percentile of your heart rate)
+        hr_high_bpm: Optional[float] = None,  # None = auto (95th percentile of your heart rate)
         bounds: Optional[tuple[float, float, float, float]] = None,
     ) -> None:
         self.activity_types = {t.lower() for t in activity_types}
@@ -391,6 +391,38 @@ class StravaHeatmapGenerator:
 
         self._metrics_cache = metrics
         return metrics
+
+    def _auto_pace_range(self) -> tuple[float, float]:
+        """Fast/slow pace thresholds (sec/mile) for color scaling. Uses
+        `fast_pace`/`slow_pace` if the constructor was given explicit values;
+        otherwise auto-computed from the 5th/95th percentile of this runner's
+        own per-route average pace, so the color scale always spans whoever's
+        data is loaded rather than assuming a specific pace band. Percentiles
+        (not raw min/max) keep one GPS glitch or an easy walk break from
+        blowing out the whole scale."""
+        if self.fast_pace is not None and self.slow_pace is not None:
+            return self.fast_pace, self.slow_pace
+        paces = [m["avg_pace"] for m in self._route_metrics()]
+        if not paces:
+            return self.fast_pace or 360.0, self.slow_pace or 540.0
+        fast = self.fast_pace if self.fast_pace is not None else float(np.percentile(paces, 5))
+        slow = self.slow_pace if self.slow_pace is not None else float(np.percentile(paces, 95))
+        if slow <= fast:
+            slow = fast + 30.0  # keep a visible band even if every run is nearly the same pace
+        return fast, slow
+
+    def _auto_hr_range(self) -> tuple[float, float]:
+        """Same auto-scaling as `_auto_pace_range`, for heart rate (bpm)."""
+        if self.hr_low is not None and self.hr_high is not None:
+            return self.hr_low, self.hr_high
+        hrs = [m["avg_hr"] for m in self._route_metrics() if m["avg_hr"] is not None]
+        if not hrs:
+            return self.hr_low or 130.0, self.hr_high or 175.0
+        low = self.hr_low if self.hr_low is not None else float(np.percentile(hrs, 5))
+        high = self.hr_high if self.hr_high is not None else float(np.percentile(hrs, 95))
+        if high <= low:
+            high = low + 10.0
+        return low, high
 
     def _cluster_routes(
         self, grid_deg: float = 0.0009, jaccard_threshold: float = 0.55, dist_tolerance: float = 0.25,
@@ -642,13 +674,15 @@ class StravaHeatmapGenerator:
         def fmt(sec: float) -> str:
             return f"{int(sec) // 60}:{int(sec) % 60:02d}/mi"
 
-        return self._gradient_legend_html("_legendPace", "Pace", self.fast_pace, self.slow_pace, fmt, visible)
+        fast, slow = self._auto_pace_range()
+        return self._gradient_legend_html("_legendPace", "Pace", fast, slow, fmt, visible)
 
     def _hr_legend_html(self, visible: bool = False) -> str:
         def fmt(bpm: float) -> str:
             return f"{int(round(bpm))} bpm"
 
-        return self._gradient_legend_html("_legendHR", "Heart Rate", self.hr_low, self.hr_high, fmt, visible)
+        low, high = self._auto_hr_range()
+        return self._gradient_legend_html("_legendHR", "Heart Rate", low, high, fmt, visible)
 
     def _daily_mileage_df(self) -> tuple[pd.DataFrame, list[int]]:
         """Per-day mileage/time/pace, reindexed to a continuous daily range so
@@ -1008,12 +1042,15 @@ class StravaHeatmapGenerator:
             print("No routes loaded — run .load() first")
             return
 
+        fast_pace, slow_pace = self._auto_pace_range()
+        hr_low, hr_high = self._auto_hr_range()
+
         run_data = []
         for rm in self._route_metrics():
             sampled = rm["route"][::coord_stride] or rm["route"]
-            pace_color = _value_to_hex(rm["avg_pace"], self.fast_pace, self.slow_pace)
+            pace_color = _value_to_hex(rm["avg_pace"], fast_pace, slow_pace)
             hr_color = (
-                _value_to_hex(rm["avg_hr"], self.hr_low, self.hr_high)
+                _value_to_hex(rm["avg_hr"], hr_low, hr_high)
                 if rm["avg_hr"] is not None else None
             )
             run_data.append({

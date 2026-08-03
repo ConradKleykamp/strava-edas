@@ -99,10 +99,10 @@ StravaHeatmapGenerator(
     heatmap_blur=10,                 # density heatmap blur, in pixels
     heatmap_min_opacity=0.3,         # density heatmap minimum opacity
     default_zoom=12,                 # initial map zoom level
-    fast_pace_sec_per_mile=360.0,    # pace (sec/mi) treated as "fast" for color scaling — 6:00/mi
-    slow_pace_sec_per_mile=540.0,    # pace (sec/mi) treated as "slow" for color scaling — 9:00/mi
-    hr_low_bpm=130.0,                # heart rate (bpm) treated as "easy" for color scaling
-    hr_high_bpm=175.0,               # heart rate (bpm) treated as "hard" for color scaling
+    fast_pace_sec_per_mile=None,     # pace (sec/mi) treated as "fast" for color scaling — None = auto
+    slow_pace_sec_per_mile=None,     # pace (sec/mi) treated as "slow" for color scaling — None = auto
+    hr_low_bpm=None,                 # heart rate (bpm) treated as "easy" for color scaling — None = auto
+    hr_high_bpm=None,                # heart rate (bpm) treated as "hard" for color scaling — None = auto
     bounds=None,                     # optional (min_lat, max_lat, min_lon, max_lon) filter
 ).run()
 ```
@@ -116,6 +116,27 @@ that behavior:
 
 ```python
 StravaHeatmapGenerator(bounds=MA_BOUNDS).run()
+```
+
+### Pace & heart-rate color scaling
+
+`strava_animated.html`'s route coloring (and its legend) needs a "fast"/"easy"
+end and a "slow"/"hard" end to scale against. By default (`None`) these are
+auto-computed from **your own data** — the 5th and 95th percentile of your
+per-route average pace (and heart rate, if present) — so the color scale
+always spans whoever's export is loaded instead of assuming a specific pace
+band. Percentiles are used rather than raw min/max so one GPS glitch or an
+easy walk break doesn't blow out the whole scale.
+
+Pass explicit values for any of the four if you want a fixed scale instead —
+e.g. to keep colors comparable across regenerations, or across two different
+people's exports:
+
+```python
+StravaHeatmapGenerator(
+    fast_pace_sec_per_mile=360.0,  # 6:00/mi
+    slow_pace_sec_per_mile=540.0,  # 9:00/mi
+).run()
 ```
 
 ## Heart rate
