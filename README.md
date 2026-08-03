@@ -8,7 +8,10 @@ locally against the export you already have.
   with a per-year layer toggle and a total miles/activities/date-range overlay
 - `strava_calendar.html` — GitHub-style calendar heatmap of daily mileage, plus
   monthly mileage bars, weekly mileage and pace trend lines, current/longest
-  streak callouts, and stars marking days you set an all-time PR
+  streak callouts, and stars marking days you set an all-time PR. Scales to
+  however many years your export covers — it draws one calendar row per year
+  that actually has activity, so a gap (a hiatus, or a stray old activity years
+  before your real training data) doesn't pad the page with blank year rows
 - `strava_animated.html` — chronological replay of your routes accumulating on
   the map over time, with a pace (or heart rate) legend, stats ticker, segment
   PRs, and a "Hide Map" toggle for sharing without exposing your location

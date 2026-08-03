@@ -486,6 +486,14 @@ class StravaHeatmapGenerator:
         daily = pd.DataFrame(records)
         daily["date"] = pd.to_datetime(daily["date"])
 
+        # Years that actually have logged activity — captured before the reindex
+        # below fills every day in between, since that reindex would otherwise
+        # pull in fully blank calendar-heatmap rows for any inactive year sitting
+        # between two active ones (e.g. a hiatus, or one old stray activity years
+        # before a training block).
+        years = sorted(daily["date"].dt.year.unique())
+        n_years = len(years)
+
         full_range = pd.date_range(daily["date"].min(), daily["date"].max(), freq="D")
         daily = (
             daily.set_index("date")
@@ -498,8 +506,6 @@ class StravaHeatmapGenerator:
         daily["pace"] = daily["pace"].fillna("—")
         daily["name"] = daily["name"].fillna("")
 
-        years = sorted(daily["date"].dt.year.unique())
-        n_years = len(years)
         global_max = max(daily["miles"].max(), 0.1)
 
         # PR-day lookup: date -> labels of any all-time-best segment set that day,
