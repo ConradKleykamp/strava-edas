@@ -1,11 +1,15 @@
 # Strava EDAs
 
-Turn your Strava bulk data export into three interactive HTML visualizations —
+Turn your Strava bulk data export into four interactive HTML visualizations —
 no Strava API access, account linking, or server required. Everything runs
 locally against the export you already have.
 
 - `strava_heatmap.html` — density heatmap of every GPS point you've recorded,
-  with a per-year layer toggle and a total miles/activities/date-range overlay
+  with a per-year layer toggle and a total miles/activities/date-range overlay.
+  Routes you've repeated are automatically clustered into a "most-run routes"
+  leaderboard (ranked by how often you run them), each entry toggling a
+  highlighted trace of that specific route on the map and zooming to it. If
+  you never repeat a route, the leaderboard is simply omitted
 - `strava_calendar.html` — GitHub-style calendar heatmap of daily mileage, plus
   monthly mileage bars, weekly mileage and pace trend lines, current/longest
   streak callouts, and stars marking days you set an all-time PR. Scales to
@@ -15,6 +19,10 @@ locally against the export you already have.
 - `strava_animated.html` — chronological replay of your routes accumulating on
   the map over time, with a pace (or heart rate) legend, stats ticker, segment
   PRs, and a "Hide Map" toggle for sharing without exposing your location
+- `strava_wrapped.html` — a shareable, story-card "Wrapped" summary: one set of
+  slides (miles, pace, streaks, PRs, favorite route, fun equivalences) per
+  calendar year, plus an all-time set, selectable via a pill bar and navigated
+  like a story (arrows, dot nav, keyboard, or swipe)
 
 This works with anyone's Strava data — just drop in your own export.
 
@@ -24,17 +32,20 @@ Built for **running** data, and defaults to only including `Run` activities
 (`DEFAULT_TYPES = {"run"}`). The pace coloring, GPS-noise filtering, and PR
 distances throughout `generate_strava_edas.py` are all tuned around running paces.
 
-The density heatmap and calendar heatmap are activity-agnostic — pointing
-`activity_types` at `{"ride"}`, `{"walk"}`, `{"hike"}`, etc. (see
-[Configuration](#configuration)) works fine for those two outputs, since they
-just aggregate GPS points and distance/time. The animated replay
-(`strava_animated.html`) will not: it discards any segment faster than
-5:00/mile as GPS noise, which throws out real cycling (or any faster) data,
-and its pace-based color scale and PR distances (400m through half marathon)
-are calibrated for running paces and race distances. Using it for a faster
-activity type requires overriding `fast_pace_sec_per_mile` /
+The density heatmap (including its route-clustering leaderboard) and calendar
+heatmap are activity-agnostic — pointing `activity_types` at `{"ride"}`,
+`{"walk"}`, `{"hike"}`, etc. (see [Configuration](#configuration)) works fine
+for those two outputs, since they just aggregate GPS points and distance/time.
+The animated replay (`strava_animated.html`) will not: it discards any segment
+faster than 5:00/mile as GPS noise, which throws out real cycling (or any
+faster) data, and its pace-based color scale and PR distances (400m through
+half marathon) are calibrated for running paces and race distances. Using it
+for a faster activity type requires overriding `fast_pace_sec_per_mile` /
 `slow_pace_sec_per_mile` at minimum, and the PR panel will still be
-meaningless for anything other than running.
+meaningless for anything other than running. `strava_wrapped.html` sits in
+between: its mileage/pace/streak/route slides work for any activity type, but
+its PR slide reuses the same running-specific distances, and its "marathons
+worth of running" framing is meaningless for a non-running activity type.
 
 ## Setup
 
@@ -71,7 +82,7 @@ holds the per-activity GPS files it references via its `Filename` column.
 python3 generate_strava_edas.py
 ```
 
-Open any of the three generated HTML files in a browser.
+Open any of the four generated HTML files in a browser.
 
 ## Configuration
 
