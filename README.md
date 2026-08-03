@@ -1,4 +1,4 @@
-# Strava Heatmap
+# Strava EDAs
 
 Turn your Strava bulk data export into three interactive HTML visualizations —
 no Strava API access, account linking, or server required. Everything runs

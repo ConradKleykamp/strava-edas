@@ -1,5 +1,5 @@
 """
-Strava Heatmap Generator
+Strava EDA Generator
 Produces three interactive HTML outputs from any Strava bulk data export:
   - strava_heatmap.html   : density heatmap of all GPS points
   - strava_calendar.html  : GitHub-style calendar heatmap of daily mileage
@@ -327,7 +327,6 @@ class StravaHeatmapGenerator:
                 "route": route,
                 "start_ts": start_ts,
                 "total_dist": total_dist,
-                "total_time": total_time,
                 "avg_pace": avg_pace,
                 "avg_hr": avg_hr,
                 "prs": prs,
@@ -915,7 +914,6 @@ class StravaHeatmapGenerator:
 
         <script>
         const _routes = {json.dumps(run_data)};
-        const _hasHR = {json.dumps(has_hr)};
         let _idx = 0, _playing = false, _speed = 200;
         let _group = null, _layers = [], _totalMiles = 0, _paceSum = 0, _hrSum = 0, _hrCount = 0;
         let _prs = {{}};
