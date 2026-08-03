@@ -90,6 +90,15 @@ def _parse_moving_time(val: object) -> float:
         return 0.0
 
 
+def _fmt_pace(sec_per_mile: Optional[float]) -> Optional[str]:
+    """"M:SS/mi" from a seconds-per-mile pace, or None if there's nothing
+    valid to show (no pace data, or a non-positive value) — every call site
+    that has its own no-data placeholder (a dash, `None`) applies it on top."""
+    if sec_per_mile is None or pd.isna(sec_per_mile) or sec_per_mile <= 0:
+        return None
+    return f"{int(sec_per_mile) // 60}:{int(round(sec_per_mile % 60)):02d}/mi"
+
+
 def _streak_stats(active: np.ndarray) -> tuple[int, int]:
     """(longest, current) consecutive-active-day streaks from a boolean array
     ordered oldest→newest. "Current" is the run of active days ending on the
@@ -512,11 +521,8 @@ class StravaHeatmapGenerator:
         FeatureGroups already added to the map in `build_heatmap`) and
         zooming to its bounds."""
 
-        def _fmt_pace(sec: float) -> str:
-            return f"{int(sec) // 60}:{int(round(sec % 60)):02d}/mi"
-
         rows, bounds_list = [], []
-        for rank, (cl, layer_var) in enumerate(zip(clusters, layer_vars), start=1):
+        for rank, cl in enumerate(clusters, start=1):
             members = cl["members"]
             distances = [mm["total_dist"] / 1609.344 for mm in members]
             med_dist = statistics.median(distances)
@@ -664,12 +670,6 @@ class StravaHeatmapGenerator:
         else:
             df["run_name"] = ""
 
-        def _fmt_pace(secs: float, mi: float) -> str:
-            if not mi or secs <= 0:
-                return "—"
-            pace = secs / mi
-            return f"{int(pace) // 60}:{int(round(pace % 60)):02d}/mi"
-
         records = []
         for dt, grp in df.groupby("date_only"):
             mi = grp["miles"].sum()
@@ -678,7 +678,7 @@ class StravaHeatmapGenerator:
             name = grp["run_name"].iloc[0] if cnt == 1 else f"{cnt} runs"
             records.append({
                 "date": dt, "miles": mi, "secs": sc,
-                "pace": _fmt_pace(sc, mi), "name": str(name),
+                "pace": _fmt_pace(sc / mi if mi else None) or "—", "name": str(name),
             })
 
         daily = pd.DataFrame(records)
@@ -920,16 +920,10 @@ class StravaHeatmapGenerator:
         )
 
         # Weekly pace trend with 4-week rolling average (min/mi, lower = faster)
-        def _fmt_pace_sec(secs: float) -> str:
-            if pd.isna(secs):
-                return "—"
-            secs = int(round(secs))
-            return f"{secs // 60}:{secs % 60:02d}/mi"
-
         weekly["pace"] = np.where(weekly["miles"] > 0, weekly["secs"] / weekly["miles"], np.nan)
         weekly["pace_rolling4"] = weekly["pace"].rolling(4, min_periods=1).mean()
-        weekly["pace_fmt"] = weekly["pace"].apply(_fmt_pace_sec)
-        weekly["pace_rolling4_fmt"] = weekly["pace_rolling4"].apply(_fmt_pace_sec)
+        weekly["pace_fmt"] = weekly["pace"].apply(lambda s: _fmt_pace(s) or "—")
+        weekly["pace_rolling4_fmt"] = weekly["pace_rolling4"].apply(lambda s: _fmt_pace(s) or "—")
 
         pace_row = n_years + 3
         fig.add_trace(
@@ -1306,11 +1300,6 @@ class StravaHeatmapGenerator:
         clusters = self._cluster_routes()
         month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-        def _fmt_pace(sec: Optional[float]) -> Optional[str]:
-            if sec is None or sec <= 0:
-                return None
-            return f"{int(sec) // 60}:{int(round(sec % 60)):02d}/mi"
-
         def _scope_stats(year: Optional[int]) -> dict:
             sub = df if year is None else df[df["year"] == year]
             sub_daily = daily if year is None else daily[daily["year"] == year]
@@ -1418,7 +1407,7 @@ class StravaHeatmapGenerator:
   :root {{
     --bg: #0d1117; --surface: #161b22; --ink: #f0f0f0; --ink-dim: #8b949e;
     --accent: #fc4c02; --accent-dim: rgba(252,76,2,0.18);
-    --green: #4ade80; --gold: #ffd700;
+    --gold: #ffd700;
   }}
   * {{ box-sizing: border-box; }}
   html, body {{
