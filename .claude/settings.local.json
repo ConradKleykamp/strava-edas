@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m py_compile generate_heatmap.py)",
+      "Bash(python3 *)"
+    ]
+  }
+}

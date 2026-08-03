@@ -1,9 +1,14 @@
 """
 Strava Heatmap Generator
-Produces three interactive HTML outputs from a Strava data export:
+Produces three interactive HTML outputs from any Strava bulk data export:
   - strava_heatmap.html   : density heatmap of all GPS points
   - strava_calendar.html  : GitHub-style calendar heatmap of daily mileage
   - strava_animated.html  : chronological replay — runs accumulate on the map over time
+
+Works out of the box with any user's exported strava/ folder — no code changes
+required. All tuning knobs (activity type, region filtering, pace thresholds,
+heatmap styling) are optional constructor arguments on StravaHeatmapGenerator;
+see README.md for details. See run() at the bottom for the default entry point.
 """
 
 import csv
@@ -26,7 +31,11 @@ DATA_DIR = Path("strava")
 ACTIVITIES_CSV = DATA_DIR / "activities.csv"
 DEFAULT_TYPES = {"run"}
 
-# Massachusetts bounding box (min_lat, max_lat, min_lon, max_lon)
+# Example bounding box (min_lat, max_lat, min_lon, max_lon), included only as a
+# sample for the author's own data (Massachusetts). Bounds filtering is OFF by
+# default — pass `bounds=MA_BOUNDS`, or your own (min_lat, max_lat, min_lon,
+# max_lon) tuple, to StravaHeatmapGenerator() if you want to restrict routes
+# to a specific region.
 MA_BOUNDS = (41.239, 42.886, -73.508, -69.928)
 
 # PR distances: (display label, element id suffix, meters)
@@ -104,7 +113,7 @@ class StravaHeatmapGenerator:
         default_zoom: int = 12,
         fast_pace_sec_per_mile: float = 360.0,   # 6:00/mi
         slow_pace_sec_per_mile: float = 540.0,   # 9:00/mi
-        bounds: Optional[tuple[float, float, float, float]] = MA_BOUNDS,
+        bounds: Optional[tuple[float, float, float, float]] = None,
     ) -> None:
         self.activity_types = {t.lower() for t in activity_types}
         self.heatmap_radius = heatmap_radius
@@ -758,4 +767,9 @@ class StravaHeatmapGenerator:
 
 
 if __name__ == "__main__":
+    # Default: uses every activity type in DEFAULT_TYPES, no geographic filtering.
     StravaHeatmapGenerator().run()
+
+    # To restrict to a region (e.g. the author's own Massachusetts example data),
+    # pass a bounds tuple instead:
+    #   StravaHeatmapGenerator(bounds=MA_BOUNDS).run()
