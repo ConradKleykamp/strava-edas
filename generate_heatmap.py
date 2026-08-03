@@ -47,9 +47,16 @@ PR_DISTANCES = [
     ("10K",    "10k",   10000.0),
     ("HALF",   "half",  21097.5),
 ]
+PR_LABELS = {key: label for label, key, _ in PR_DISTANCES}
 
-# (lat, lon, timestamp)
-Point = tuple[float, float, Optional[datetime]]
+# (lat, lon, timestamp, heart_rate_bpm)
+Point = tuple[float, float, Optional[datetime], Optional[float]]
+
+# Localname (namespace-agnostic) of the GPX extension tag various devices/apps
+# use for per-point heart rate: Garmin TrackPointExtension (<gpxtpx:hr>), some
+# older exports (<gpxdata:hr>), etc. We match on tag name alone since the
+# namespace prefix/URI varies by exporter.
+_HR_TAG_NAMES = {"hr", "heartrate"}
 
 
 def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -61,9 +68,13 @@ def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def _pace_to_hex(pace_sec_per_mile: float, fast: float, slow: float) -> str:
-    """Map pace (sec/mile) to a hex color: green → yellow → red."""
-    t = max(0.0, min(1.0, (pace_sec_per_mile - fast) / (slow - fast)))
+def _value_to_hex(value: float, good: float, bad: float) -> str:
+    """Map a value between `good` and `bad` to a hex color: green → yellow → red.
+
+    Used for both pace (low seconds/mile = good) and heart rate (low bpm = good),
+    since in both cases a smaller value represents lower effort.
+    """
+    t = max(0.0, min(1.0, (value - good) / (bad - good)))
     if t <= 0.5:
         s = t * 2
         r, g, b = int(s * 255), int(168 + s * 47), int(107 - s * 107)
@@ -113,6 +124,8 @@ class StravaHeatmapGenerator:
         default_zoom: int = 12,
         fast_pace_sec_per_mile: float = 360.0,   # 6:00/mi
         slow_pace_sec_per_mile: float = 540.0,   # 9:00/mi
+        hr_low_bpm: float = 130.0,               # heart rate treated as "easy" for color scaling
+        hr_high_bpm: float = 175.0,              # heart rate treated as "hard" for color scaling
         bounds: Optional[tuple[float, float, float, float]] = None,
     ) -> None:
         self.activity_types = {t.lower() for t in activity_types}
@@ -122,12 +135,16 @@ class StravaHeatmapGenerator:
         self.default_zoom = default_zoom
         self.fast_pace = fast_pace_sec_per_mile
         self.slow_pace = slow_pace_sec_per_mile
+        self.hr_low = hr_low_bpm
+        self.hr_high = hr_high_bpm
         self.bounds = bounds
 
         self._activities: list[dict] = []
         self._all_coords: list[tuple[float, float]] = []
         self._routes: list[list[Point]] = []
+        self._route_csv_hr: list[Optional[float]] = []
         self._included_filenames: set[str] = set()
+        self._metrics_cache: Optional[list[dict]] = None
 
     # ------------------------------------------------------------------
     # Loading
@@ -159,6 +176,7 @@ class StravaHeatmapGenerator:
         routes: list[list[Point]] = []
         all_coords: list[tuple[float, float]] = []
         self._included_filenames = set()
+        self._route_csv_hr = []
         skipped = 0
         for activity in self._activities:
             filename = activity.get("Filename", "").strip()
@@ -173,9 +191,20 @@ class StravaHeatmapGenerator:
             routes.append(points)
             all_coords.extend((p[0], p[1]) for p in points)
             self._included_filenames.add(filename)
+            self._route_csv_hr.append(self._csv_avg_hr(activity))
         if skipped:
             print(f"  Excluded {skipped} routes outside bounds")
         return routes, all_coords
+
+    @staticmethod
+    def _csv_avg_hr(activity: dict) -> Optional[float]:
+        """Per-activity average heart rate from the CSV, used as a fallback when
+        the GPX file itself has no per-point heart rate extension."""
+        raw = activity.get("Average Heart Rate", "")
+        try:
+            return float(raw) if raw not in (None, "") else None
+        except ValueError:
+            return None
 
     def _parse_gpx(self, path: Path) -> list[Point]:
         if not path.exists():
@@ -194,11 +223,32 @@ class StravaHeatmapGenerator:
                         ts = datetime.fromisoformat(time_el.text.replace("Z", "+00:00"))
                     except ValueError:
                         pass
-                points.append((float(lat), float(lon), ts))
+                hr = self._parse_hr_extension(trkpt)
+                points.append((float(lat), float(lon), ts, hr))
             return points
         except Exception as e:
             print(f"  Skipping {path.name}: {e}")
             return []
+
+    @staticmethod
+    def _parse_hr_extension(trkpt: ET.Element) -> Optional[float]:
+        """Namespace-agnostic search for a heart-rate value under <extensions>.
+
+        Different devices/exporters use different extension namespaces
+        (e.g. Garmin TrackPointExtension), so we match on the tag's local
+        name rather than requiring a specific schema.
+        """
+        ext = trkpt.find(f"{{{GPX_NS}}}extensions")
+        if ext is None:
+            return None
+        for el in ext.iter():
+            local = el.tag.rsplit("}", 1)[-1].lower()
+            if local in _HR_TAG_NAMES and el.text:
+                try:
+                    return float(el.text)
+                except ValueError:
+                    return None
+        return None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -212,56 +262,190 @@ class StravaHeatmapGenerator:
     def _base_map(self, center: tuple[float, float]) -> folium.Map:
         return folium.Map(location=center, zoom_start=self.default_zoom, tiles="CartoDB dark_matter")
 
+    def _load_activity_df(self) -> pd.DataFrame:
+        """Activities from the CSV, filtered to the configured activity types and
+        to the routes that actually parsed successfully, with `date`/`miles` columns
+        added. Shared by every output that needs per-activity stats."""
+        df = pd.read_csv(ACTIVITIES_CSV)
+        df = df[df["Activity Type"].str.lower().isin(self.activity_types)].copy()
+        if self._included_filenames:
+            df = df[df["Filename"].isin(self._included_filenames)]
+        df["date"] = pd.to_datetime(df["Activity Date"], format="mixed")
+        df["miles"] = pd.to_numeric(df["Distance"], errors="coerce") * 0.621371
+        return df
+
+    def _route_metrics(self) -> list[dict]:
+        """Chronologically sorted per-route stats: distance, avg pace, avg heart
+        rate, segment PR splits, and which PRs were newly set (all-time-best as
+        of that route). Heart rate prefers the GPX per-point extension (averaged
+        over the route) and falls back to the CSV's per-activity average.
+
+        Cached after the first call — shared by build_animated_routes and the
+        calendar's PR-day overlay so the PR computation only runs once.
+        """
+        if self._metrics_cache is not None:
+            return self._metrics_cache
+
+        paired = zip(self._routes, self._route_csv_hr)
+        timed_routes = [(route, csv_hr, route[0][2]) for route, csv_hr in paired if route[0][2] is not None]
+        timed_routes.sort(key=lambda x: x[2])
+
+        bests: dict[str, float] = {}
+        metrics: list[dict] = []
+        for route, csv_hr, start_ts in timed_routes:
+            timed = [p for p in route if p[2] is not None]
+            if len(timed) < 2:
+                continue
+
+            # Build cumulative distance array once; reuse for total_dist and all PRs.
+            cum = [0.0]
+            for i in range(1, len(timed)):
+                cum.append(cum[-1] + _haversine(
+                    timed[i - 1][0], timed[i - 1][1], timed[i][0], timed[i][1]
+                ))
+            total_dist = cum[-1]
+            total_time = (timed[-1][2] - timed[0][2]).total_seconds()  # type: ignore[operator]
+            if total_dist < 10 or total_time <= 0:
+                continue
+
+            avg_pace = (total_time / total_dist) * 1609.344
+
+            gpx_hrs = [p[3] for p in timed if p[3] is not None]
+            avg_hr = (sum(gpx_hrs) / len(gpx_hrs)) if gpx_hrs else csv_hr
+
+            prs = {
+                key: (round(t, 1) if (t := _best_segment_time(cum, timed, dist_m)) else None)
+                for _, key, dist_m in PR_DISTANCES
+            }
+            new_prs = []
+            for key, t in prs.items():
+                if t is not None and (key not in bests or t < bests[key]):
+                    bests[key] = t
+                    new_prs.append(key)
+
+            metrics.append({
+                "route": route,
+                "start_ts": start_ts,
+                "total_dist": total_dist,
+                "total_time": total_time,
+                "avg_pace": avg_pace,
+                "avg_hr": avg_hr,
+                "prs": prs,
+                "new_prs": new_prs,
+            })
+
+        self._metrics_cache = metrics
+        return metrics
+
     # ------------------------------------------------------------------
     # Outputs
     # ------------------------------------------------------------------
 
     def build_heatmap(self, output: str = "strava_heatmap.html") -> None:
+        """Density heatmap with a per-year layer toggle and a stats overlay.
+
+        Each year gets its own togglable heat layer (via folium's LayerControl)
+        so you can isolate a single year or compare several, in addition to the
+        default "All Years" combined view.
+        """
         if not self._all_coords:
             print("No coordinates loaded — run .load() first")
             return
         m = self._base_map(self._center())
-        HeatMap(
-            self._all_coords,
-            radius=self.heatmap_radius,
-            blur=self.heatmap_blur,
-            min_opacity=self.heatmap_min_opacity,
-        ).add_to(m)
+
+        year_coords: dict[str, list[tuple[float, float]]] = {}
+        for route in self._routes:
+            ts = next((p[2] for p in route if p[2] is not None), None)
+            year = str(ts.year) if ts else "Unknown date"
+            year_coords.setdefault(year, []).extend((p[0], p[1]) for p in route)
+
+        def _add_heat_layer(name: str, coords: list[tuple[float, float]], show: bool) -> None:
+            fg = folium.FeatureGroup(name=name, show=show)
+            HeatMap(
+                coords,
+                radius=self.heatmap_radius,
+                blur=self.heatmap_blur,
+                min_opacity=self.heatmap_min_opacity,
+            ).add_to(fg)
+            fg.add_to(m)
+
+        _add_heat_layer("All Years", self._all_coords, show=True)
+        for year in sorted(year_coords, reverse=True):
+            _add_heat_layer(year, year_coords[year], show=False)
+
+        folium.LayerControl(collapsed=False).add_to(m)
+        m.get_root().html.add_child(folium.Element(self._heatmap_stats_html()))
+
         m.save(output)
         print(f"Density heatmap saved → {output}")
 
-    def _pace_legend_html(self) -> str:
-        def fmt(sec: float) -> str:
-            return f"{int(sec) // 60}:{int(sec) % 60:02d}/mi"
-
-        mid = (self.fast_pace + self.slow_pace) / 2
-        g = _pace_to_hex(self.fast_pace, self.fast_pace, self.slow_pace)
-        y = _pace_to_hex(mid, self.fast_pace, self.slow_pace)
-        r = _pace_to_hex(self.slow_pace, self.fast_pace, self.slow_pace)
+    def _heatmap_stats_html(self) -> str:
+        df = self._load_activity_df()
+        total_miles = df["miles"].sum()
+        total_activities = len(df)
+        date_min, date_max = df["date"].min(), df["date"].max()
+        date_range = f"{date_min.strftime('%b %Y')} – {date_max.strftime('%b %Y')}"
         return f"""
-        <div style="position:fixed;bottom:30px;right:10px;z-index:9999;
+        <div style="position:fixed;bottom:30px;left:10px;z-index:9999;
+            background:rgba(25,25,25,0.88);color:#ddd;font-family:sans-serif;
+            padding:12px 20px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.6);
+            min-width:220px;">
+            <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;text-align:center;">
+                <div>
+                    <div style="font-size:10px;color:#888;letter-spacing:.6px;margin-bottom:3px;">TOTAL MILES</div>
+                    <div style="font-size:20px;font-weight:600;">{total_miles:.1f}</div>
+                </div>
+                <div>
+                    <div style="font-size:10px;color:#888;letter-spacing:.6px;margin-bottom:3px;">ACTIVITIES</div>
+                    <div style="font-size:20px;font-weight:600;">{total_activities}</div>
+                </div>
+            </div>
+            <div style="text-align:center;margin-top:8px;padding-top:8px;border-top:1px solid #333;
+                font-size:11px;color:#aaa;">{date_range}</div>
+        </div>"""
+
+    def _gradient_legend_html(
+        self, dom_id: str, label: str, good: float, bad: float, fmt, visible: bool
+    ) -> str:
+        """Build a fixed-position gradient legend (green→yellow→red) for a
+        value range. Shared by the pace legend and the optional HR legend so
+        both look and behave identically, just toggled by `visible`."""
+        mid = (good + bad) / 2
+        g = _value_to_hex(good, good, bad)
+        y = _value_to_hex(mid, good, bad)
+        r = _value_to_hex(bad, good, bad)
+        display = "block" if visible else "none"
+        return f"""
+        <div id="{dom_id}" style="display:{display};position:fixed;bottom:30px;right:10px;z-index:9999;
                     background:rgba(25,25,25,0.88);color:#ddd;
                     font-family:sans-serif;font-size:12px;
                     padding:10px 14px;border-radius:6px;
                     box-shadow:0 2px 8px rgba(0,0,0,0.6)">
-            <b style="display:block;margin-bottom:8px;letter-spacing:.5px">Pace</b>
+            <b style="display:block;margin-bottom:8px;letter-spacing:.5px">{label}</b>
             <div style="display:flex;align-items:center;gap:8px">
-                <span>{fmt(self.fast_pace)}</span>
+                <span>{fmt(good)}</span>
                 <div style="width:90px;height:6px;border-radius:3px;
                     background:linear-gradient(to right,{g},{y},{r})"></div>
-                <span>{fmt(self.slow_pace)}</span>
+                <span>{fmt(bad)}</span>
             </div>
         </div>"""
 
-    def build_calendar_heatmap(self, output: str = "strava_calendar.html") -> None:
-        """Year-per-row calendar heatmap + monthly bar chart + weekly trend line."""
-        df = pd.read_csv(ACTIVITIES_CSV)
-        df = df[df["Activity Type"].str.lower().isin(self.activity_types)].copy()
-        if self._included_filenames:
-            df = df[df["Filename"].isin(self._included_filenames)]
+    def _pace_legend_html(self, visible: bool = True) -> str:
+        def fmt(sec: float) -> str:
+            return f"{int(sec) // 60}:{int(sec) % 60:02d}/mi"
 
-        df["date"] = pd.to_datetime(df["Activity Date"], format="mixed")
-        df["miles"] = pd.to_numeric(df["Distance"], errors="coerce") * 0.621371
+        return self._gradient_legend_html("_legendPace", "Pace", self.fast_pace, self.slow_pace, fmt, visible)
+
+    def _hr_legend_html(self, visible: bool = False) -> str:
+        def fmt(bpm: float) -> str:
+            return f"{int(round(bpm))} bpm"
+
+        return self._gradient_legend_html("_legendHR", "Heart Rate", self.hr_low, self.hr_high, fmt, visible)
+
+    def build_calendar_heatmap(self, output: str = "strava_calendar.html") -> None:
+        """Year-per-row calendar heatmap + monthly bar chart + weekly mileage and
+        pace trends, with streak callouts and PR-day markers."""
+        df = self._load_activity_df()
         df["date_only"] = df["date"].dt.normalize()
 
         def _parse_mt(val: object) -> float:
@@ -311,12 +495,37 @@ class StravaHeatmapGenerator:
             .rename(columns={"index": "date"})
         )
         daily["miles"] = daily["miles"].fillna(0.0)
+        daily["secs"] = daily["secs"].fillna(0.0)
         daily["pace"] = daily["pace"].fillna("—")
         daily["name"] = daily["name"].fillna("")
 
         years = sorted(daily["date"].dt.year.unique())
         n_years = len(years)
         global_max = max(daily["miles"].max(), 0.1)
+
+        # PR-day lookup: date -> labels of any all-time-best segment set that day,
+        # reusing the same PR computation build_animated_routes relies on.
+        pr_days: dict[pd.Timestamp, list[str]] = {}
+        for rm in self._route_metrics():
+            if rm["new_prs"]:
+                # GPX timestamps are tz-aware (UTC); the calendar's dates are tz-naive
+                # (parsed from the CSV's local-time "Activity Date"), so drop tzinfo here
+                # rather than converting — matches the date build_animated_routes shows.
+                d = pd.Timestamp(rm["start_ts"].replace(tzinfo=None)).normalize()
+                pr_days.setdefault(d, []).extend(PR_LABELS[k] for k in rm["new_prs"])
+
+        # Streak stats: longest run of active days, and the streak ending on the
+        # most recent day present in the export.
+        active = (daily["miles"] > 0).to_numpy()
+        longest_streak = cur = 0
+        for a in active:
+            cur = cur + 1 if a else 0
+            longest_streak = max(longest_streak, cur)
+        current_streak = 0
+        for a in active[::-1]:
+            if not a:
+                break
+            current_streak += 1
 
         COLORSCALE = [
             [0.0,  "#161b22"],
@@ -327,11 +536,11 @@ class StravaHeatmapGenerator:
         ]
         DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-        row_heights = [1.0] * n_years + [2.5, 2.5]
-        subtitles = [str(y) for y in years] + ["Monthly Mileage", "Weekly Mileage"]
+        row_heights = [1.0] * n_years + [2.5, 2.5, 2.5]
+        subtitles = [str(y) for y in years] + ["Monthly Mileage", "Weekly Mileage", "Weekly Pace"]
 
         fig = make_subplots(
-            rows=n_years + 2,
+            rows=n_years + 3,
             cols=1,
             shared_xaxes=False,
             row_heights=row_heights,
@@ -375,6 +584,18 @@ class StravaHeatmapGenerator:
 
             customdata = np.stack([cd_date, cd_detail], axis=-1)
 
+            # PR-day markers: star at any cell where an all-time-best was set
+            pr_x, pr_y, pr_text = [], [], []
+            for pr_date, labels in pr_days.items():
+                if pr_date.year != year:
+                    continue
+                offset = (pr_date - grid_start).days
+                w_i, d_i = offset // 7, offset % 7
+                if 0 <= w_i < n_weeks:
+                    pr_x.append(w_i)
+                    pr_y.append(DAY_LABELS[d_i])
+                    pr_text.append(", ".join(labels) + " PR")
+
             # Month tick positions: first week each month appears in the year
             tick_vals: list[int] = []
             tick_text: list[str] = []
@@ -409,6 +630,19 @@ class StravaHeatmapGenerator:
                 ),
                 row=row_idx, col=1,
             )
+            if pr_x:
+                fig.add_trace(
+                    go.Scatter(
+                        x=pr_x, y=pr_y,
+                        mode="markers",
+                        marker=dict(symbol="star", size=9, color="#ffd700",
+                                    line=dict(color="#0d1117", width=1)),
+                        text=pr_text,
+                        hovertemplate="<b>%{text}</b><extra></extra>",
+                        showlegend=False,
+                    ),
+                    row=row_idx, col=1,
+                )
             fig.update_xaxes(
                 tickmode="array", tickvals=tick_vals, ticktext=tick_text,
                 showgrid=False, zeroline=False,
@@ -454,7 +688,7 @@ class StravaHeatmapGenerator:
 
         # Weekly trend with 4-week rolling average
         daily["week_start"] = daily["date"] - pd.to_timedelta(daily["date"].dt.dayofweek, unit="D")
-        weekly = daily.groupby("week_start")["miles"].sum().reset_index().sort_values("week_start")
+        weekly = daily.groupby("week_start")[["miles", "secs"]].sum().reset_index().sort_values("week_start")
         weekly["rolling4"] = weekly["miles"].rolling(4, min_periods=1).mean()
 
         trend_row = n_years + 2
@@ -491,15 +725,71 @@ class StravaHeatmapGenerator:
             row=trend_row, col=1,
         )
 
-        height = n_years * 130 + 560 + 100
+        # Weekly pace trend with 4-week rolling average (min/mi, lower = faster)
+        def _fmt_pace_sec(secs: float) -> str:
+            if pd.isna(secs):
+                return "—"
+            secs = int(round(secs))
+            return f"{secs // 60}:{secs % 60:02d}/mi"
+
+        weekly["pace"] = np.where(weekly["miles"] > 0, weekly["secs"] / weekly["miles"], np.nan)
+        weekly["pace_rolling4"] = weekly["pace"].rolling(4, min_periods=1).mean()
+        weekly["pace_fmt"] = weekly["pace"].apply(_fmt_pace_sec)
+        weekly["pace_rolling4_fmt"] = weekly["pace_rolling4"].apply(_fmt_pace_sec)
+
+        pace_row = n_years + 3
+        fig.add_trace(
+            go.Scatter(
+                x=weekly["week_start"], y=(weekly["pace"] / 60).round(2),
+                mode="lines",
+                line=dict(color="#4ade80", width=1),
+                opacity=0.35,
+                customdata=weekly["pace_fmt"],
+                hovertemplate="Week of %{x|%b %d, %Y}<br>%{customdata}<extra></extra>",
+                showlegend=False, name="Weekly Pace",
+            ),
+            row=pace_row, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=weekly["week_start"], y=(weekly["pace_rolling4"] / 60).round(2),
+                mode="lines",
+                line=dict(color="#22c55e", width=2.5),
+                customdata=weekly["pace_rolling4_fmt"],
+                hovertemplate="4-wk avg (week of %{x|%b %d, %Y})<br>%{customdata}<extra></extra>",
+                showlegend=False, name="4-wk avg pace",
+            ),
+            row=pace_row, col=1,
+        )
+        fig.update_xaxes(
+            showgrid=False, zeroline=False,
+            tickfont=dict(color="#aaa", size=10),
+            row=pace_row, col=1,
+        )
+        fig.update_yaxes(
+            showgrid=True, gridcolor="#1c2330", zeroline=False,
+            tickfont=dict(color="#aaa"),
+            title_text="min/mi", title_font=dict(color="#888", size=11),
+            row=pace_row, col=1,
+        )
+
+        height = n_years * 130 + 560 + 100 + 240
+
+        streak_note = f"Current streak: {current_streak}d · Longest streak: {longest_streak}d"
+        if pr_days:
+            streak_note += " · ★ = new all-time PR"
+        title_text = (
+            f"Running Dashboard<br>"
+            f"<span style='font-size:13px;color:#888'>{streak_note}</span>"
+        )
 
         fig.update_layout(
-            title=dict(text="Running Dashboard", font=dict(size=22, color="#eee"), x=0.5),
+            title=dict(text=title_text, font=dict(size=22, color="#eee"), x=0.5),
             paper_bgcolor="#0d1117",
             plot_bgcolor="#0d1117",
             font=dict(color="#ccc", family="sans-serif"),
             height=height,
-            margin=dict(l=60, r=80, t=80, b=60),
+            margin=dict(l=60, r=80, t=100, b=60),
             bargap=0.12,
             hoverlabel=dict(bgcolor="#1e2530", font_color="#eee", bordercolor="#333"),
         )
@@ -518,55 +808,47 @@ class StravaHeatmapGenerator:
         For each run the best segment time is pre-computed in Python (two-pointer sliding
         window over cumulative GPS distances) and shipped in the JSON payload so the
         JavaScript only needs to compare values — no heavy computation in the browser.
+
+        If heart rate data is available (per-point GPX extension, or a per-activity
+        average from the CSV), a Pace/HR color toggle is included; otherwise it's
+        omitted entirely rather than shown non-functional. A "Hide Map" toggle is
+        always included so the replay can be screenshotted/recorded for sharing
+        without exposing the underlying map — note this only hides the on-screen
+        basemap, the raw route coordinates still live in the page's source.
         """
         if not self._routes:
             print("No routes loaded — run .load() first")
             return
 
-        timed_routes = [(r, r[0][2]) for r in self._routes if r[0][2] is not None]
-        timed_routes.sort(key=lambda x: x[1])
-
         run_data = []
-        for route, start_ts in timed_routes:
-            timed = [p for p in route if p[2] is not None]
-            if len(timed) < 2:
-                continue
-
-            # Build cumulative distance array once; reuse for total_dist and all PRs.
-            cum = [0.0]
-            for i in range(1, len(timed)):
-                cum.append(cum[-1] + _haversine(
-                    timed[i - 1][0], timed[i - 1][1], timed[i][0], timed[i][1]
-                ))
-            total_dist = cum[-1]
-            total_time = (timed[-1][2] - timed[0][2]).total_seconds()  # type: ignore[operator]
-            if total_dist < 10 or total_time <= 0:
-                continue
-
-            avg_pace = (total_time / total_dist) * 1609.344
-            color = _pace_to_hex(avg_pace, self.fast_pace, self.slow_pace)
-            sampled = route[::coord_stride] or route
-
-            prs = {
-                key: (round(t, 1) if (t := _best_segment_time(cum, timed, dist_m)) else None)
-                for _, key, dist_m in PR_DISTANCES
-            }
-
+        for rm in self._route_metrics():
+            sampled = rm["route"][::coord_stride] or rm["route"]
+            pace_color = _value_to_hex(rm["avg_pace"], self.fast_pace, self.slow_pace)
+            hr_color = (
+                _value_to_hex(rm["avg_hr"], self.hr_low, self.hr_high)
+                if rm["avg_hr"] is not None else None
+            )
             run_data.append({
                 "coords": [[p[0], p[1]] for p in sampled],
-                "color": color,
-                "date": start_ts.strftime("%b %d, %Y"),
-                "miles": round(total_dist / 1609.344, 2),
-                "pace_sec": round(avg_pace),
-                "prs": prs,
+                "color": pace_color,
+                "hr_color": hr_color,
+                "hr": round(rm["avg_hr"]) if rm["avg_hr"] is not None else None,
+                "date": rm["start_ts"].strftime("%b %d, %Y"),
+                "miles": round(rm["total_dist"] / 1609.344, 2),
+                "pace_sec": round(rm["avg_pace"]),
+                "prs": rm["prs"],
             })
 
         if not run_data:
             print("No routes with sufficient timestamp data")
             return
 
+        has_hr = any(r["hr"] is not None for r in run_data)
+
         m = self._base_map(self._center())
-        m.get_root().html.add_child(folium.Element(self._pace_legend_html()))
+        m.get_root().html.add_child(folium.Element(self._pace_legend_html(visible=True)))
+        if has_hr:
+            m.get_root().html.add_child(folium.Element(self._hr_legend_html(visible=False)))
 
         map_var = m.get_name()
         total = len(run_data)
@@ -578,6 +860,10 @@ class StravaHeatmapGenerator:
                 </div>"""
             for label, key, _ in PR_DISTANCES
         )
+
+        hr_btn = """<button id="_hrbtn" onclick="_toggleColorMode()"
+                style="background:#333;border:none;color:#ddd;padding:5px 12px;
+                       border-radius:4px;cursor:pointer;font-size:12px;">Color: Pace</button>""" if has_hr else ""
 
         overlay = f"""
         <div id="_ctrl" style="position:fixed;top:20px;left:50%;transform:translateX(-50%);
@@ -595,6 +881,10 @@ class StravaHeatmapGenerator:
                 <input id="_spd" type="range" min="0" max="700" value="500" step="50"
                     style="width:70px;cursor:pointer;" oninput="_setSpeed(this.value);">
             </label>
+            {hr_btn}
+            <button id="_mapbtn" onclick="_toggleMap()"
+                style="background:#333;border:none;color:#ddd;padding:5px 12px;
+                       border-radius:4px;cursor:pointer;font-size:12px;">Hide Map</button>
         </div>
 
         <div id="_stats" style="position:fixed;bottom:30px;left:10px;z-index:9999;
@@ -611,7 +901,7 @@ class StravaHeatmapGenerator:
                     <div id="_sruns" style="font-size:20px;font-weight:600;">0</div>
                 </div>
                 <div>
-                    <div style="font-size:10px;color:#888;letter-spacing:.6px;margin-bottom:3px;">AVG PACE</div>
+                    <div style="font-size:10px;color:#888;letter-spacing:.6px;margin-bottom:3px;" id="_spaceLabel">AVG PACE</div>
                     <div id="_space" style="font-size:20px;font-weight:600;">—</div>
                 </div>
             </div>
@@ -625,9 +915,12 @@ class StravaHeatmapGenerator:
 
         <script>
         const _routes = {json.dumps(run_data)};
+        const _hasHR = {json.dumps(has_hr)};
         let _idx = 0, _playing = false, _speed = 200;
-        let _group = null, _layers = [], _totalMiles = 0, _paceSum = 0;
+        let _group = null, _layers = [], _totalMiles = 0, _paceSum = 0, _hrSum = 0, _hrCount = 0;
         let _prs = {{}};
+        let _colorMode = 'pace';
+        let _mapHidden = false;
 
         const _OP = [0.85, 0.65, 0.45, 0.30];
         const _OP_FLOOR = 0.18;
@@ -651,6 +944,30 @@ class StravaHeatmapGenerator:
             return m + ':' + String(s).padStart(2,'0') + '/mi';
         }}
 
+        function _colorFor(r) {{
+            if (_colorMode === 'hr') return r.hr_color || '#555';
+            return r.color;
+        }}
+
+        function _toggleColorMode() {{
+            _colorMode = (_colorMode === 'pace') ? 'hr' : 'pace';
+            document.getElementById('_hrbtn').textContent = 'Color: ' + (_colorMode === 'hr' ? 'HR' : 'Pace');
+            document.getElementById('_legendPace').style.display = (_colorMode === 'pace') ? 'block' : 'none';
+            document.getElementById('_legendHR').style.display = (_colorMode === 'hr') ? 'block' : 'none';
+            for (let i = 0; i < _layers.length; i++) {{
+                _layers[i].setStyle({{color: _colorFor(_routes[i])}});
+            }}
+            _updateStats();
+        }}
+
+        function _toggleMap() {{
+            _mapHidden = !_mapHidden;
+            const tilePane = document.querySelector('.leaflet-tile-pane');
+            if (tilePane) tilePane.style.display = _mapHidden ? 'none' : '';
+            {map_var}.getContainer().style.background = _mapHidden ? '#000' : '';
+            document.getElementById('_mapbtn').textContent = _mapHidden ? 'Show Map' : 'Hide Map';
+        }}
+
         function _updateOpacities() {{
             const n = _layers.length;
             const upd = Math.min(n, _OP.length + 1);
@@ -659,11 +976,20 @@ class StravaHeatmapGenerator:
             }}
         }}
 
+        function _fmtHR(bpm) {{ return Math.round(bpm) + ' bpm'; }}
+
         function _updateStats() {{
             document.getElementById('_smiles').textContent = _totalMiles.toFixed(1);
             document.getElementById('_sruns').textContent = _idx;
-            if (_idx > 0)
-                document.getElementById('_space').textContent = _fmtPace(_paceSum / _idx);
+            const label = document.getElementById('_spaceLabel');
+            const value = document.getElementById('_space');
+            if (_colorMode === 'hr') {{
+                label.textContent = 'AVG HR';
+                value.textContent = _hrCount > 0 ? _fmtHR(_hrSum / _hrCount) : '—';
+            }} else {{
+                label.textContent = 'AVG PACE';
+                value.textContent = _idx > 0 ? _fmtPace(_paceSum / _idx) : '—';
+            }}
         }}
 
         function _updatePRs(runPRs) {{
@@ -689,7 +1015,7 @@ class StravaHeatmapGenerator:
         }}
 
         function _traceRun(r, onDone) {{
-            const poly = L.polyline([], {{color: r.color, weight: 2, opacity: _OP[0]}}).addTo(_group);
+            const poly = L.polyline([], {{color: _colorFor(r), weight: 2, opacity: _OP[0]}}).addTo(_group);
             _layers.push(poly);
             _updateOpacities();
             const pts = r.coords;
@@ -712,6 +1038,7 @@ class StravaHeatmapGenerator:
             const r = _routes[_idx];
             _totalMiles += r.miles;
             _paceSum += r.pace_sec;
+            if (r.hr !== null) {{ _hrSum += r.hr; _hrCount++; }}
             _idx++;
             document.getElementById('_date').textContent = r.date;
             document.getElementById('_count').textContent = _idx + ' / ' + _routes.length;
@@ -725,14 +1052,14 @@ class StravaHeatmapGenerator:
         function _toggle() {{
             const btn = document.getElementById('_btn');
             if (btn.textContent === 'Replay') {{
-                _idx = 0; _totalMiles = 0; _paceSum = 0; _layers = [];
+                _idx = 0; _totalMiles = 0; _paceSum = 0; _hrSum = 0; _hrCount = 0; _layers = [];
                 _group.clearLayers();
                 _resetPRs();
                 document.getElementById('_date').textContent = '—';
                 document.getElementById('_count').textContent = '0 / ' + _routes.length;
                 document.getElementById('_smiles').textContent = '0.0';
                 document.getElementById('_sruns').textContent = '0';
-                document.getElementById('_space').textContent = '—';
+                _updateStats();
                 btn.textContent = 'Play';
                 return;
             }}

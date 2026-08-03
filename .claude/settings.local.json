@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(python3 -m py_compile generate_heatmap.py)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Bash(grep -n \"row=row_idx, col=1,\\\\|fig.update_yaxes\\(\\\\s*$\\\\|# Monthly bar chart\" /Users/conradkleykamp/Documents/strava-heatmap/generate_heatmap.py)"
     ]
   }
 }

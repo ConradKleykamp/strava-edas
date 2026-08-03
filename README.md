@@ -4,11 +4,14 @@ Turn your Strava bulk data export into three interactive HTML visualizations —
 no Strava API access, account linking, or server required. Everything runs
 locally against the export you already have.
 
-- `strava_heatmap.html` — density heatmap of every GPS point you've recorded
+- `strava_heatmap.html` — density heatmap of every GPS point you've recorded,
+  with a per-year layer toggle and a total miles/activities/date-range overlay
 - `strava_calendar.html` — GitHub-style calendar heatmap of daily mileage, plus
-  monthly mileage bars and a weekly mileage trend line
+  monthly mileage bars, weekly mileage and pace trend lines, current/longest
+  streak callouts, and stars marking days you set an all-time PR
 - `strava_animated.html` — chronological replay of your routes accumulating on
-  the map over time, with a pace legend, stats ticker, and segment PRs
+  the map over time, with a pace (or heart rate) legend, stats ticker, segment
+  PRs, and a "Hide Map" toggle for sharing without exposing your location
 
 This works with anyone's Strava data — just drop in your own export.
 
@@ -84,6 +87,8 @@ StravaHeatmapGenerator(
     default_zoom=12,                 # initial map zoom level
     fast_pace_sec_per_mile=360.0,    # pace (sec/mi) treated as "fast" for color scaling — 6:00/mi
     slow_pace_sec_per_mile=540.0,    # pace (sec/mi) treated as "slow" for color scaling — 9:00/mi
+    hr_low_bpm=130.0,                # heart rate (bpm) treated as "easy" for color scaling
+    hr_high_bpm=175.0,               # heart rate (bpm) treated as "hard" for color scaling
     bounds=None,                     # optional (min_lat, max_lat, min_lon, max_lon) filter
 ).run()
 ```
@@ -99,9 +104,33 @@ that behavior:
 StravaHeatmapGenerator(bounds=MA_BOUNDS).run()
 ```
 
+## Heart rate
+
+`strava_animated.html` includes a Pace/HR color toggle automatically **if**
+your data has heart rate in it — no configuration needed. It checks two
+sources, in order:
+
+1. Per-point heart rate from the GPX file's `<extensions>` block, if your
+   device/export includes it (e.g. Garmin's TrackPointExtension).
+2. Per-activity `Average Heart Rate` from `activities.csv`, as a fallback.
+
+If neither is present for any activity (as with the author's own example
+data), the toggle and its legend are simply omitted rather than shown
+non-functional.
+
 ## Privacy
 
-Everything runs locally — your activity data never leaves your machine. The
-generated HTML files embed your coordinates directly, so treat them like any
-other file containing your location history (e.g. don't publish
-`strava_animated.html` publicly if you'd rather keep your routes private).
+Everything runs locally — your activity data never leaves your machine.
+
+The generated HTML files embed your exact coordinates directly in the page
+source (in a `<script>` block), so treat them like any other file containing
+your location history — e.g. don't publish `strava_animated.html` publicly if
+you'd rather keep your routes private.
+
+`strava_animated.html`'s "Hide Map" button swaps the basemap for a black
+background so you can screen-record or screenshot the animated replay without
+showing street/place context. This is a **visual-only** toggle: it does not
+remove or alter the coordinates embedded in the file itself. It's meant for
+sharing a recording or screenshot of what's on screen — if you instead share
+the raw `.html` file, your exact route coordinates are still readable from its
+source regardless of whether the map is hidden on screen.
