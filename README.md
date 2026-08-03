@@ -19,7 +19,7 @@ This works with anyone's Strava data — just drop in your own export.
 
 Built for **running** data, and defaults to only including `Run` activities
 (`DEFAULT_TYPES = {"run"}`). The pace coloring, GPS-noise filtering, and PR
-distances throughout `generate_heatmap.py` are all tuned around running paces.
+distances throughout `generate_strava_edas.py` are all tuned around running paces.
 
 The density heatmap and calendar heatmap are activity-agnostic — pointing
 `activity_types` at `{"ride"}`, `{"walk"}`, `{"hike"}`, etc. (see
@@ -65,7 +65,7 @@ holds the per-activity GPS files it references via its `Filename` column.
 ## Usage
 
 ```bash
-python3 generate_heatmap.py
+python3 generate_strava_edas.py
 ```
 
 Open any of the three generated HTML files in a browser.
@@ -73,11 +73,11 @@ Open any of the three generated HTML files in a browser.
 ## Configuration
 
 All tuning is done by passing arguments to `StravaHeatmapGenerator` in
-`generate_heatmap.py` — no other code changes needed. Everything below is
+`generate_strava_edas.py` — no other code changes needed. Everything below is
 optional; sensible defaults are used if you omit it.
 
 ```python
-from generate_heatmap import StravaHeatmapGenerator, MA_BOUNDS
+from generate_strava_edas import StravaHeatmapGenerator, MA_BOUNDS
 
 StravaHeatmapGenerator(
     activity_types={"run"},          # which "Activity Type" values (from the CSV) to include
